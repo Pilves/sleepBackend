@@ -12,15 +12,36 @@ const cors = require('cors');
  * @param {Object} app - Express application instance
  */
 const configureSecurityMiddleware = (app) => {
-  // Helmet for security HTTP headers
-  app.use(helmet());
+  // Helmet for security HTTP headers with production settings
+  app.use(helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'"],
+        styleSrc: ["'self'"],
+        imgSrc: ["'self'"],
+        connectSrc: ["'self'"],
+        frameSrc: ["'none'"],
+        objectSrc: ["'none'"]
+      }
+    },
+    hsts: process.env.NODE_ENV === 'production' ? {
+      maxAge: 31536000, // 1 year in seconds
+      includeSubDomains: true,
+      preload: true
+    } : false,
+    frameguard: {
+      action: 'deny'
+    },
+    referrerPolicy: { policy: 'same-origin' }
+  }));
 
 
   // CORS configuration
   const corsOptions = {
     //only front domain in prod
     origin: process.env.NODE_ENV === 'production'
-      ? process.env.ALLOWED_ORIGINS.split(',')
+      ? (process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : ['*'])
       : ['http://localhost:5173'],
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
     allowedHeaders: ['Content-Type', 'Authorization'],
