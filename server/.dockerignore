@@ -1,0 +1,36 @@
+# Node modules
+node_modules
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# Firebase service account
+serviceAccountKey.json
+
+# Development and test files
+test-api.js
+*.test.js
+tests/
+coverage/
+
+# Git files
+.git
+.gitignore
+
+# Docker files
+Dockerfile
+.dockerignore
+
+# Miscellaneous
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/

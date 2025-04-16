@@ -1,0 +1,4 @@
+2025-04-16T23:31:07.090Z [32minfo[39m: 	Environment variables loaded.
+2025-04-16T23:31:08.621Z [32minfo[39m: 	Firebase Admin initialized successfully
+2025-04-16T23:31:08.622Z [32minfo[39m: 	firestoreUtils initialized successfully with methods:
+2025-04-16T23:31:08.646Z [32minfo[39m: 	Server running on port 5000 in development mode vibe
