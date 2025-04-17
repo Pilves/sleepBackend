@@ -1,8 +1,7 @@
 #!/bin/bash
 
 # This script will set up the initial SSL certificates using Certbot
-# Using IP address directly
-domains=(157.180.75.112)
+domains=(api.chaidla.ee)
 email="patricpaidla@gmail.com" # Email for Let's Encrypt notifications
 data_path="./certbot"
 staging=0 # Set to 1 if you're testing to avoid hitting rate limits
@@ -15,13 +14,13 @@ if [ -d "$data_path" ]; then
 fi
 
 # Create directories for certbot
-mkdir -p "$data_path/conf/live/$domains"
+mkdir -p "$data_path/conf/live/${domains[0]}"
 mkdir -p "$data_path/www"
 
 # Create dummy certificates to start nginx with https
 openssl req -x509 -nodes -newkey rsa:4096 -days 1 \
-  -keyout "$data_path/conf/live/$domains[0]/privkey.pem" \
-  -out "$data_path/conf/live/$domains[0]/fullchain.pem" \
+  -keyout "$data_path/conf/live/${domains[0]}/privkey.pem" \
+  -out "$data_path/conf/live/${domains[0]}/fullchain.pem" \
   -subj "/CN=localhost"
 
 echo "Starting nginx..."
