@@ -2,7 +2,7 @@ const admin = require('firebase-admin');
 require('dotenv').config();
 
 // Get frontend URL from environment
-const FRONTEND_URL = process.env.FRONTEND_URL || 'https://pilves.github.io/sleep/';
+const FRONTEND_URL = 'https://pilves.github.io/sleep/';
 
 // Middleware to verify user is authenticated with Firebase
 const authenticate = async (req, res, next) => {
