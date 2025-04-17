@@ -19,4 +19,4 @@ jobs:
           host: ${{ secrets.HOST }}
           username: ${{ secrets.USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          script: ~/sleep-olympics/deploy.sh
+          script: ~/pro/sleepBackend/server/scripts/deploy.sh
