@@ -39,10 +39,9 @@ const configureSecurityMiddleware = (app) => {
 
   // CORS configuration
   const corsOptions = {
-    //only front domain in prod
     origin: process.env.NODE_ENV === 'production'
-      ? ['https://pilves.github.io', 'http://localhost:5173', '*']
-      : ['http://localhost:5173'],
+        ? ['https://pilves.github.io', 'http://localhost:5173']
+        : ['http://localhost:5173'],
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true,
