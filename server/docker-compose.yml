@@ -1,6 +1,35 @@
 version: '3.8'
 
 services:
+  # NGINX service for SSL and reverse proxy
+  nginx:
+    image: nginx:1.26-alpine
+    container_name: sleep-olympics-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf
+      - ./certbot/www:/var/www/certbot
+      - ./certbot/conf:/etc/nginx/ssl
+    depends_on:
+      - api
+    networks:
+      - sleep-network
+
+  # Certbot service for SSL certificates
+  certbot:
+    image: certbot/certbot
+    container_name: sleep-olympics-certbot
+    volumes:
+      - ./certbot/www:/var/www/certbot
+      - ./certbot/conf:/etc/letsencrypt
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+    networks:
+      - sleep-network
+
+  # API service
   api:
     build:
       context: .
@@ -13,8 +42,9 @@ services:
         limits:
           cpus: '0.5'
           memory: 512M
-    ports:
-      - "80:5000"  # Map port 80 from host to port 5000 in container
+    # Only expose to internal network, not externally
+    expose:
+      - "5000"
     volumes:
       - ./logs:/app/logs
     env_file:
@@ -33,6 +63,12 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    networks:
+      - sleep-network
+
+networks:
+  sleep-network:
+    driver: bridge
 
 volumes:
   logs:
