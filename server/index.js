@@ -81,6 +81,9 @@ async function startServer() {
 
   //   3. Create Express app
   const app = express();
+  
+  // Set trust proxy - required when behind Nginx
+  app.set('trust proxy', true);
 
   //   4. Apply middleware
   configureSecurityMiddleware(app);
