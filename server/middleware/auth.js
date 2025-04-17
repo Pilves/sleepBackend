@@ -2,7 +2,7 @@ const admin = require('firebase-admin');
 require('dotenv').config();
 
 // Get frontend URL from environment
-const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://pilves.github.io/sleep/';
 
 // Middleware to verify user is authenticated with Firebase
 const authenticate = async (req, res, next) => {
@@ -12,7 +12,7 @@ const authenticate = async (req, res, next) => {
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       // Check if client is requesting JSON (API request) or HTML (browser request)
       const acceptHeader = req.headers.accept || '';
-      
+
       if (acceptHeader.includes('text/html')) {
         // Redirect to frontend for browser requests
         console.log('Redirecting unauthenticated user to frontend homepage');
@@ -45,9 +45,9 @@ const authenticate = async (req, res, next) => {
         return res.redirect(FRONTEND_URL);
       } else {
         // Return JSON error for API requests
-        return res.status(401).json({ 
-          error: 'TokenExpired', 
-          message: 'Firebase ID token has expired. Please refresh the token.' 
+        return res.status(401).json({
+          error: 'TokenExpired',
+          message: 'Firebase ID token has expired. Please refresh the token.'
         });
       }
     }
@@ -70,7 +70,7 @@ const isAdmin = async (req, res, next) => {
     if (!userId) {
       // Check if client is requesting JSON (API request) or HTML (browser request)
       const acceptHeader = req.headers.accept || '';
-      
+
       if (acceptHeader.includes('text/html')) {
         // Redirect to frontend for browser requests
         console.log('Redirecting unauthenticated user to frontend homepage');
@@ -88,7 +88,7 @@ const isAdmin = async (req, res, next) => {
     if (!userData || !userData.roles || !userData.roles.includes('admin')) {
       // Check if client is requesting JSON (API request) or HTML (browser request)
       const acceptHeader = req.headers.accept || '';
-      
+
       if (acceptHeader.includes('text/html')) {
         // Redirect to frontend homepage when not admin
         console.log('Redirecting non-admin user to frontend homepage');
@@ -102,10 +102,10 @@ const isAdmin = async (req, res, next) => {
     next();
   } catch (error) {
     console.error('Admin check error:', error);
-    
+
     // Check if client is requesting JSON (API request) or HTML (browser request)
     const acceptHeader = req.headers.accept || '';
-    
+
     if (acceptHeader.includes('text/html')) {
       // Redirect to frontend for browser requests
       return res.redirect(FRONTEND_URL);
