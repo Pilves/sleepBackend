@@ -98,23 +98,9 @@ async function startServer() {
     next();
   });
   
-  // Add CORS headers to every response
-  app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', 'https://pilves.github.io');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    res.header('Access-Control-Allow-Credentials', 'true');
-    next();
-  });
   
   // Adding an explicit CORS test endpoint
-  app.get('/api/cors-test', (req, res) => {
-    // Manually set CORS headers for this route
-    res.header('Access-Control-Allow-Origin', 'https://pilves.github.io');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    res.header('Access-Control-Allow-Credentials', 'true');
-    
+  app.get('/api/cors-test', (req, res) => {    
     res.status(200).json({
       status: 'ok',
       message: 'CORS is properly configured',
@@ -136,11 +122,7 @@ async function startServer() {
     res.status(200).json({
       status: 'ok',
       message: 'Sleep Olympics API is running',
-      environment: process.env.NODE_ENV || 'development',
-      version: process.env.npm_package_version || '1.0.0',
-      timestamp: new Date().toISOString(),
-      corsOrigin: req.headers.origin || 'No origin header',
-      allowedOrigin: 'https://pilves.github.io'
+      timestamp: new Date().toISOString()
     });
   });
 
