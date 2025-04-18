@@ -42,7 +42,7 @@ const configureSecurityMiddleware = (app) => {
   // Default to development origins if not specified
   const getAllowedOrigins = () => {
     if (process.env.NODE_ENV === 'production') {
-      const prodOrigins = process.env.ALLOWED_ORIGINS || 'https://pilves.github.io,https://api.chaidla.ee';
+      const prodOrigins = process.env.ALLOWED_ORIGINS || 'https://pilves.github.io';
       return prodOrigins.split(',').map(origin => origin.trim());
     } else {
       const devOrigins = process.env.DEV_ALLOWED_ORIGINS || 'http://localhost:5173,http://localhost:5000,http://localhost:3000';
@@ -59,12 +59,12 @@ const configureSecurityMiddleware = (app) => {
       
       // In production, explicitly allow the frontend origins
       if (process.env.NODE_ENV === 'production') {
-        const allowedOrigins = ['https://pilves.github.io'];
+        const allowedOrigins = getAllowedOrigins();
         if (allowedOrigins.includes(origin)) {
           callback(null, true);
         } else {
           console.warn(`Origin ${origin} not allowed by CORS policy. Allowed origins:`, allowedOrigins);
-          callback(null, true); // Currently allowing all origins for troubleshooting
+          callback(new Error(`CORS not allowed for origin: ${origin}`), false);
         }
       } else {
         // In development, allow all origins

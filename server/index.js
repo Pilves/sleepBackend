@@ -98,6 +98,22 @@ async function startServer() {
     next();
   });
   
+  // CORS error handler
+  app.use((err, req, res, next) => {
+    if (err.message && err.message.includes('CORS not allowed')) {
+      logger.warn(`CORS error: ${err.message}`);
+      return res.status(403).json({
+        error: 'CORS Error',
+        message: 'Cross-Origin Request Blocked',
+        requestOrigin: req.headers.origin || 'unknown',
+        allowedOrigins: process.env.NODE_ENV === 'production' 
+          ? (process.env.ALLOWED_ORIGINS || 'https://pilves.github.io').split(',').map(o => o.trim())
+          : 'All origins in development'
+      });
+    }
+    next(err);
+  });
+  
   // Adding an explicit CORS test endpoint
   app.get('/api/cors-test', (req, res) => {
     res.status(200).json({
@@ -126,7 +142,7 @@ async function startServer() {
       timestamp: new Date().toISOString(),
       corsOrigin: req.headers.origin || 'No origin header',
       allowedOrigins: process.env.NODE_ENV === 'production' 
-        ? (process.env.ALLOWED_ORIGINS || 'https://pilves.github.io,https://api.chaidla.ee').split(',') 
+        ? (process.env.ALLOWED_ORIGINS || 'https://pilves.github.io').split(',') 
         : (process.env.DEV_ALLOWED_ORIGINS || 'http://localhost:5173,http://localhost:5000').split(',')
     });
   });
