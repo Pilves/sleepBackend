@@ -4,3 +4,8 @@ deploy.md
 .env.production
 node_modules/
 serviceAccountKey.json
+
+# Certbot files
+certbot/
+*.pem
+private_key.json
