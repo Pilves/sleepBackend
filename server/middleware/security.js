@@ -38,10 +38,32 @@ const configureSecurityMiddleware = (app) => {
 
 
   // CORS configuration
+  // Get allowed origins from environment variables for more flexibility
+  // Default to development origins if not specified
+  const getAllowedOrigins = () => {
+    if (process.env.NODE_ENV === 'production') {
+      const prodOrigins = process.env.ALLOWED_ORIGINS || 'https://pilves.github.io,https://api.chaidla.ee';
+      return prodOrigins.split(',').map(origin => origin.trim());
+    } else {
+      const devOrigins = process.env.DEV_ALLOWED_ORIGINS || 'http://localhost:5173,http://localhost:5000';
+      return devOrigins.split(',').map(origin => origin.trim());
+    }
+  };
+
   const corsOptions = {
-    origin: process.env.NODE_ENV === 'production'
-        ? 'https://pilves.github.io'
-        : ['http://localhost:5173'],
+    origin: function (origin, callback) {
+      const allowedOrigins = getAllowedOrigins();
+      
+      // Allow requests with no origin (like mobile apps or curl requests)
+      if (!origin) return callback(null, true);
+      
+      if (allowedOrigins.indexOf(origin) !== -1 || process.env.NODE_ENV !== 'production') {
+        callback(null, true);
+      } else {
+        console.warn(`Origin ${origin} not allowed by CORS policy. Allowed origins:`, allowedOrigins);
+        callback(new Error('Not allowed by CORS'));
+      }
+    },
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'DNT', 'User-Agent', 'X-Requested-With', 'If-Modified-Since', 'Cache-Control', 'Content-Type', 'Range'],
     credentials: true,
@@ -49,7 +71,11 @@ const configureSecurityMiddleware = (app) => {
     maxAge: 86400 // 24 hours
   };
 
+  // Apply CORS middleware
   app.use(cors(corsOptions));
+  
+  // Handle preflight requests
+  app.options('*', cors(corsOptions));
 
   // HTTPS redirection removed as we're no longer using Nginx
 

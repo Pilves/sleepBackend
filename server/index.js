@@ -84,11 +84,21 @@ async function startServer() {
   
   // No longer behind Nginx
 
-  //   4. Apply middleware
+  //   4. Apply middleware - note that security (including CORS) should be first
   configureSecurityMiddleware(app);
   configureLogging(app);
   app.use(express.json());
   app.use(express.urlencoded({ extended: false }));
+  
+  // Adding an explicit CORS test endpoint
+  app.get('/api/cors-test', (req, res) => {
+    res.status(200).json({
+      status: 'ok',
+      message: 'CORS is properly configured',
+      origin: req.headers.origin || 'No origin header',
+      timestamp: new Date().toISOString()
+    });
+  });
 
   //   5. API routes
   app.use('/api/auth', authRoutes(firestoreUtils));
@@ -105,7 +115,11 @@ async function startServer() {
       message: 'Sleep Olympics API is running',
       environment: process.env.NODE_ENV || 'development',
       version: process.env.npm_package_version || '1.0.0',
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      corsOrigin: req.headers.origin || 'No origin header',
+      allowedOrigins: process.env.NODE_ENV === 'production' 
+        ? (process.env.ALLOWED_ORIGINS || 'https://pilves.github.io,https://api.chaidla.ee').split(',') 
+        : (process.env.DEV_ALLOWED_ORIGINS || 'http://localhost:5173,http://localhost:5000').split(',')
     });
   });
 
