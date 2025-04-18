@@ -40,25 +40,18 @@ const configureSecurityMiddleware = (app) => {
   // CORS configuration
   const corsOptions = {
     origin: process.env.NODE_ENV === 'production'
-        ? '*'
+        ? 'https://pilves.github.io'
         : ['http://localhost:5173'],
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'DNT', 'User-Agent', 'X-Requested-With', 'If-Modified-Since', 'Cache-Control', 'Content-Type', 'Range'],
     credentials: true,
+    exposedHeaders: ['Content-Length', 'Content-Range'],
     maxAge: 86400 // 24 hours
   };
 
   app.use(cors(corsOptions));
 
-  // Force HTTPS in production
-  if (process.env.NODE_ENV === 'production') {
-    app.use((req, res, next) => {
-      if (req.headers['x-forwarded-proto'] !== 'https') {
-        return res.redirect(`https://${req.headers.host}${req.url}`);
-      }
-      next();
-    });
-  }
+  // HTTPS redirection removed as we're no longer using Nginx
 
   // Rate limiting
   const apiLimiter = rateLimit({
