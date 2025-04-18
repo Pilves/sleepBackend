@@ -90,17 +90,10 @@ async function startServer() {
   app.use(express.json());
   app.use(express.urlencoded({ extended: false }));
   
-  // Additional CORS handling for debugging/troubleshooting
+  // Log OPTIONS requests for debugging
   app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, DNT, User-Agent, X-Requested-With, If-Modified-Since, Cache-Control, Range');
-    res.header('Access-Control-Allow-Credentials', 'true');
-    res.header('Access-Control-Expose-Headers', 'Content-Length, Content-Range');
-    
     if (req.method === 'OPTIONS') {
       logger.info(`Handling OPTIONS request from ${req.headers.origin || 'unknown origin'}`);
-      return res.status(200).end();
     }
     next();
   });
