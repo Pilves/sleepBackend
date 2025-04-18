@@ -91,13 +91,32 @@ async function startServer() {
   app.use(express.urlencoded({ extended: false }));
   
   // Log OPTIONS requests for debugging
+  // Log all requests for debugging
   app.use((req, res, next) => {
-    if (req.method === 'OPTIONS') {
-      logger.info(`Handling OPTIONS request from ${req.headers.origin || 'unknown origin'}`);
-    }
+    logger.info(`${req.method} request from ${req.headers.origin || 'unknown origin'} to ${req.originalUrl}`);
     next();
   });
   
+  // Set CORS headers manually for troubleshooting
+  app.use((req, res, next) => {
+    const allowedOrigins = ['https://pilves.github.io', 'http://localhost:5173'];
+    const origin = req.headers.origin;
+    
+    if (allowedOrigins.includes(origin)) {
+      res.header('Access-Control-Allow-Origin', origin);
+    }
+    
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.header('Access-Control-Allow-Credentials', 'true');
+    
+    // Handle preflight requests
+    if (req.method === 'OPTIONS') {
+      return res.status(200).end();
+    }
+    
+    next();
+  });
   
   // Adding an explicit CORS test endpoint
   app.get('/api/cors-test', (req, res) => {    
@@ -137,6 +156,17 @@ async function startServer() {
     if (process.env.NODE_ENV !== 'production') {
       errorResponse.stack = err.stack;
     }
+    
+    // Ensure CORS headers are set even for error responses
+    const origin = req.headers.origin;
+    const allowedOrigins = ['https://pilves.github.io', 'http://localhost:5173'];
+    
+    if (allowedOrigins.includes(origin)) {
+      res.header('Access-Control-Allow-Origin', origin);
+    }
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.header('Access-Control-Allow-Credentials', 'true');
 
     res.status(statusCode).json(errorResponse);
   });

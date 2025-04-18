@@ -37,11 +37,12 @@ const configureSecurityMiddleware = (app) => {
   }));
 
 
-  // Most basic CORS configuration
+  // Enhanced CORS configuration with specific origins
   app.use(cors({
-    origin: '*',
+    origin: ['https://pilves.github.io', 'http://localhost:5173'],
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: true
   }));
 
   // HTTPS redirection removed as we're no longer using Nginx
