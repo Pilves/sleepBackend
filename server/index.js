@@ -1,38 +1,49 @@
 /**
- * Sleep Olympics API Server
+ * Sleep Olympics API Server - Production Optimized
  */
 const express = require('express');
 const admin = require('firebase-admin');
 const path = require('path');
-const dotenv = require('dotenv'); // Import dotenv
+const dotenv = require('dotenv');
 
-dotenv.config(); // Ensure this is loaded early
+// Load environment variables once
+dotenv.config();
 
-//   Load environment variables asynchronously
-async function loadEnv() {
-  dotenv.config();
-}
+let firestore; // Declare firestore outside
 
-let firestore; //   Declare firestore outside
-
-//   Initialize Firebase Admin asynchronously
+// Initialize Firebase Admin with optimized settings
 async function initializeFirebaseAdmin() {
   try {
     let serviceAccount;
 
     if (process.env.NODE_ENV === 'production' && process.env.FIREBASE_SERVICE_ACCOUNT) {
-      //   In production, use environment variable (safer for deployment)
+      // In production, use environment variable (safer for deployment)
       serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
     } else {
-      //   In development, use local file
+      // In development, use local file
       serviceAccount = require('./serviceAccountKey.json');
     }
 
+    // Production optimized Firebase settings
+    const isProd = process.env.NODE_ENV === 'production';
     admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount)
+      credential: admin.credential.cert(serviceAccount),
+      // Optimize database connection settings for production
+      databaseAuthVariableOverride: isProd ? undefined : null,
+      // Set higher timeout for production reliability
+      httpAgent: isProd ? undefined : null
     });
 
-    firestore = admin.firestore(); //   Initialize firestore here!
+    // Initialize Firestore with caching optimizations for production
+    firestore = admin.firestore();
+    
+    if (isProd) {
+      // Optimize Firestore settings for production
+      firestore.settings({
+        ignoreUndefinedProperties: true,
+        cacheSizeBytes: 1073741824, // 1GB cache size
+      });
+    }
 
     logger.info('Firebase Admin initialized successfully');
   } catch (error) {
@@ -56,61 +67,62 @@ const notificationRoutes = require('./routes/notifications');
 const invitationRoutes = require('./routes/invitations');
 
 async function startServer() {
-  //   1. Load environment variables
-  await loadEnv();
-  logger.info('Environment variables loaded.');
-
-  //   2. Initialize Firebase Admin
+  // Initialize Firebase Admin
   await initializeFirebaseAdmin();
 
-  //   Now, pass firestore to your utils and routes!
-  // Initialize firestoreUtils with firestore
+  // Initialize firestoreUtils with optimized settings
   const firestoreUtils = require('./utils/firestoreUtils')(firestore); 
   
-  // Verify firestoreUtils has been initialized correctly
+  // Verify firestoreUtils initialization
   if (!firestoreUtils || typeof firestoreUtils.queryDocuments !== 'function') {
-    logger.error('firestoreUtils was not initialized correctly!', {
-      methods: Object.keys(firestoreUtils || {})
-    });
+    logger.error('firestoreUtils was not initialized correctly!');
     process.exit(1);
   } else {
-    logger.info('firestoreUtils initialized successfully with methods:', {
-      methods: Object.keys(firestoreUtils)
-    });
+    logger.info('firestoreUtils initialized successfully');
   }
 
-  //   3. Create Express app
+  // Create Express app with production optimizations
   const app = express();
+  const isProd = process.env.NODE_ENV === 'production';
   
-  // No longer behind Nginx
-
-  //   4. Apply middleware - note that security (including CORS) should be first
+  // Apply middleware - security first
   configureSecurityMiddleware(app);
   configureLogging(app);
-  app.use(express.json());
-  app.use(express.urlencoded({ extended: false }));
   
-  // Log OPTIONS requests for debugging
-  // Log all requests for debugging
-  app.use((req, res, next) => {
-    logger.info(`${req.method} request from ${req.headers.origin || 'unknown origin'} to ${req.originalUrl}`);
-    next();
-  });
+  // JSON parser with size limits for production
+  app.use(express.json({ 
+    limit: isProd ? '1mb' : '10mb',
+    strict: true,
+    reviver: isProd ? undefined : null
+  }));
   
-  // Set CORS headers manually for troubleshooting
+  // URL parser with size limits for production
+  app.use(express.urlencoded({ 
+    extended: false,
+    limit: isProd ? '1mb' : '10mb'
+  }));
+  
+  // In production, skip detailed request logging
+  if (!isProd) {
+    app.use((req, res, next) => {
+      logger.info(`${req.method} request from ${req.headers.origin || 'unknown origin'} to ${req.originalUrl}`);
+      next();
+    });
+  }
+  
+  // CORS handler
+  const allowedOrigins = ['https://pilves.github.io', 'http://localhost:5173'];
   app.use((req, res, next) => {
-    const allowedOrigins = ['https://pilves.github.io', 'http://localhost:5173'];
     const origin = req.headers.origin;
     
     if (allowedOrigins.includes(origin)) {
       res.header('Access-Control-Allow-Origin', origin);
+      res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+      res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+      res.header('Access-Control-Allow-Credentials', 'true');
     }
     
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    res.header('Access-Control-Allow-Credentials', 'true');
-    
-    // Handle preflight requests
+    // Fast OPTIONS handling
     if (req.method === 'OPTIONS') {
       return res.status(200).end();
     }
@@ -118,13 +130,12 @@ async function startServer() {
     next();
   });
   
-  // Adding an explicit CORS test endpoint
+  // CORS test endpoint (keep for troubleshooting)
   app.get('/api/cors-test', (req, res) => {    
     res.status(200).json({
       status: 'ok',
       message: 'CORS is properly configured',
-      origin: req.headers.origin || 'No origin header',
-      timestamp: new Date().toISOString()
+      origin: req.headers.origin || 'No origin header'
     });
   });
 
@@ -145,42 +156,70 @@ async function startServer() {
     });
   });
 
-  //   7. Global error handler
+  // Global error handler with production optimizations
   app.use((err, req, res, next) => {
     const statusCode = err.statusCode || 500;
+    const isProd = process.env.NODE_ENV === 'production';
+    
+    // In production, limit error details for security
     const errorResponse = {
-      error: err.message || 'Internal server error',
+      error: isProd && statusCode === 500 ? 'Internal server error' : (err.message || 'Internal server error'),
       requestId: req.id
     };
 
-    if (process.env.NODE_ENV !== 'production') {
+    // Only include stack trace in non-production
+    if (!isProd) {
       errorResponse.stack = err.stack;
     }
     
-    // Ensure CORS headers are set even for error responses
+    // Set CORS headers for errors
     const origin = req.headers.origin;
     const allowedOrigins = ['https://pilves.github.io', 'http://localhost:5173'];
     
     if (allowedOrigins.includes(origin)) {
       res.header('Access-Control-Allow-Origin', origin);
+      res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+      res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+      res.header('Access-Control-Allow-Credentials', 'true');
     }
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    res.header('Access-Control-Allow-Credentials', 'true');
+
+    // Log 5xx errors but not 4xx errors in production
+    if (isProd && statusCode >= 500) {
+      logger.error(`Server error: ${err.message}`, { statusCode, path: req.path });
+    }
 
     res.status(statusCode).json(errorResponse);
   });
 
-
-  //   9. Start the server
+  // Start the server with production optimizations
   const PORT = process.env.PORT || 5000;
-  app.listen(PORT, () => {
-    logger.info(
-        `Server running on port ${PORT} in ${
-            process.env.NODE_ENV || 'development'
-        } mode vibe`
-    );
+  
+  // Create the server
+  const server = app.listen(PORT, () => {
+    logger.info(`Server running on port ${PORT} in ${process.env.NODE_ENV || 'development'} mode`);
   });
+  
+  // Production optimizations for the HTTP server
+  if (process.env.NODE_ENV === 'production') {
+    // Set timeouts
+    server.timeout = 60000; // 60 seconds
+    server.keepAliveTimeout = 65000; // slightly higher than 60 seconds
+    
+    // Handle graceful shutdown
+    process.on('SIGTERM', () => {
+      logger.info('SIGTERM received, shutting down gracefully');
+      server.close(() => {
+        logger.info('Server closed');
+        process.exit(0);
+      });
+      
+      // Force close after 30 seconds if connections are still open
+      setTimeout(() => {
+        logger.error('Forcing server close after timeout');
+        process.exit(1);
+      }, 30000);
+    });
+  }
 }
 
 //   Call the async startServer function

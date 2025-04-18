@@ -10,7 +10,7 @@ require('dotenv').config();
 // Configure log file locations
 const logsDir = path.join(__dirname, '../logs');
 
-// Format options
+// Format options - PROD optimized
 const consoleFormat = winston.format.combine(
   winston.format.colorize(),
   winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
@@ -86,7 +86,7 @@ const filterSensitiveData = winston.format((info) => {
 
 // Create logger
 const logger = winston.createLogger({
-  level: process.env.LOG_LEVEL || 'info',
+  level: process.env.NODE_ENV === 'production' ? 'warn' : (process.env.LOG_LEVEL || 'info'),
   format: winston.format.combine(
     filterSensitiveData(),
     winston.format.metadata({ fillExcept: ['level', 'message', 'timestamp'] }),
@@ -94,65 +94,99 @@ const logger = winston.createLogger({
   ),
   defaultMeta: { service: 'sleep-olympics-api' },
   transports: [
-    // Console transport
-    new winston.transports.Console({
-      format: winston.format.combine(
-        filterSensitiveData(),
-        consoleFormat
-      )
-    }),
+    // Console transport - only in non-production or if explicitly enabled
+    ...(process.env.NODE_ENV !== 'production' || process.env.ENABLE_CONSOLE_LOGS === 'true' ? [
+      new winston.transports.Console({
+        format: winston.format.combine(
+          filterSensitiveData(),
+          consoleFormat
+        )
+      })
+    ] : []),
     
-    // File transports
+    // File transports with size limits
     new winston.transports.File({ 
       filename: path.join(logsDir, 'error.log'), 
       level: 'error',
       format: winston.format.combine(
         filterSensitiveData(),
         fileFormat
-      )
+      ),
+      maxsize: 5242880, // 5MB
+      maxFiles: 5,
+      tailable: true
     }),
     new winston.transports.File({ 
       filename: path.join(logsDir, 'combined.log'),
       format: winston.format.combine(
         filterSensitiveData(),
         fileFormat
-      )
+      ),
+      maxsize: 10485760, // 10MB
+      maxFiles: 5,
+      tailable: true
     })
   ],
   // Add exception and rejection handling
   exceptionHandlers: [
-    new winston.transports.File({ filename: path.join(logsDir, 'exceptions.log') })
+    new winston.transports.File({ 
+      filename: path.join(logsDir, 'exceptions.log'),
+      maxsize: 5242880, // 5MB
+      maxFiles: 3
+    })
   ],
   rejectionHandlers: [
-    new winston.transports.File({ filename: path.join(logsDir, 'rejections.log') })
+    new winston.transports.File({ 
+      filename: path.join(logsDir, 'rejections.log'),
+      maxsize: 5242880, // 5MB
+      maxFiles: 3
+    })
   ],
   exitOnError: false // Don't exit on handled exceptions
 });
 
 // Configure request logging middleware for Express
 const configureLogging = (app) => {
-  // Log all requests
+  // Request logging with performance optimization
   app.use(expressWinston.logger({
     winstonInstance: logger,
     meta: process.env.NODE_ENV !== 'production', // Log metadata in non-production
     msg: "HTTP {{req.method}} {{req.url}} {{res.statusCode}} {{res.responseTime}}ms",
     expressFormat: true,
     colorize: false,
+    // Skip large request bodies in production
+    requestWhitelist: process.env.NODE_ENV === 'production' 
+      ? ['url', 'method', 'httpVersion', 'originalUrl', 'headers.host'] 
+      : undefined,
+    // Skip large response bodies in production
+    responseWhitelist: process.env.NODE_ENV === 'production'
+      ? ['statusCode', 'responseTime']
+      : undefined,
+    // Skip detailed logging for static assets
+    dynamicMeta: (req, res) => {
+      if (req.url.match(/\.(js|css|png|jpg|jpeg|gif|ico|svg)$/)) {
+        return { isStatic: true };
+      }
+    },
     format: winston.format.combine(
       filterSensitiveData()
     ),
     ignoreRoute: (req, res) => {
-      // Don't log health checks to reduce noise
-      return req.url === '/api/health';
+      // Don't log health checks and static asset requests
+      return req.url === '/api/health' || 
+             req.url.match(/\.(js|css|png|jpg|jpeg|gif|ico|svg)$/);
     }
   }));
 
-  // Log errors
+  // Log errors - optimized for production
   app.use(expressWinston.errorLogger({
     winstonInstance: logger,
     format: winston.format.combine(
       filterSensitiveData()
-    )
+    ),
+    // In production, only log essential error information
+    dumpExceptions: process.env.NODE_ENV !== 'production',
+    showStack: process.env.NODE_ENV !== 'production'
   }));
 };
 

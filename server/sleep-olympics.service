@@ -1,0 +1,28 @@
+[Unit]
+Description=Sleep Olympics API Server
+After=network.target
+
+[Service]
+Type=simple
+User=pilv
+WorkingDirectory=/home/pilv/pro/sleepBackend/server
+ExecStart=/usr/bin/node index.js
+Restart=on-failure
+RestartSec=10
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=sleep-olympics
+Environment=NODE_ENV=production
+# Increase memory limits for Node.js
+Environment=NODE_OPTIONS=--max-old-space-size=2048
+
+# Performance optimizations
+Environment="UV_THREADPOOL_SIZE=4"
+# Security limits
+LimitNOFILE=4096
+# Resource control
+CPUQuota=80%
+MemoryLimit=3G
+
+[Install]
+WantedBy=multi-user.target
