@@ -253,37 +253,54 @@ module.exports = (firestore) => {
       const userRef = firestore.collection('users').doc(userId);
       const userDoc = await userRef.get();
       
-      // Set standard properties if not provided
-      const standardizedData = {
-        ...userData,
-        id: userId, // Ensure ID field is always set
-      };
-      
-      // Set defaults for new users
-      if (!userDoc.exists) {
+      // Handle existing users differently to preserve critical fields
+      if (userDoc.exists) {
+        console.log(`User document already exists for: ${userId}, updating carefully`);
+        
+        // Get current user data to preserve important fields
+        const existingData = userDoc.data();
+        
+        // Create update data by carefully merging
+        const updateData = {
+          ...userData,
+          id: userId,
+          // Preserve existing roles and admin status if they exist and not explicitly provided
+          roles: userData.roles || existingData.roles || ['user'],
+          isAdmin: userData.isAdmin !== undefined ? userData.isAdmin : existingData.isAdmin,
+          // Always update timestamp
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        };
+        
+        // Special handling for Oura integration to prevent overwriting entire object
+        if (userData.ouraIntegration && existingData.ouraIntegration) {
+          updateData.ouraIntegration = {
+            ...existingData.ouraIntegration,
+            ...userData.ouraIntegration
+          };
+        }
+        
+        // Update the document, merging with existing data
+        await userRef.set(updateData, { merge: true });
+        console.log(`Updated existing user document for: ${userId}`);
+      } else {
+        // Creating a new user document
         console.log(`Creating new user document for: ${userId}`);
         
-        if (!standardizedData.createdAt) {
-          standardizedData.createdAt = admin.firestore.FieldValue.serverTimestamp();
-        }
+        // Set standard properties for new users
+        const standardizedData = {
+          ...userData,
+          id: userId, // Ensure ID field is always set
+          createdAt: userData.createdAt || admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          roles: userData.roles || ['user'], // Default role
+          isActive: userData.isActive !== undefined ? userData.isActive : true, // Default active status
+          ouraIntegration: userData.ouraIntegration || { connected: false },
+          notifications: userData.notifications || { email: true, inApp: true }
+        };
         
-        if (!standardizedData.roles) {
-          standardizedData.roles = ['user']; // Default role
-        }
-        
-        if (!standardizedData.isActive && standardizedData.isActive !== false) {
-          standardizedData.isActive = true; // Default active status
-        }
-      }
-      
-      // Always update timestamp
-      standardizedData.updatedAt = admin.firestore.FieldValue.serverTimestamp();
-      
-      // Set or merge the document
-      if (merge) {
-        await userRef.set(standardizedData, { merge: true });
-      } else {
+        // Create the document
         await userRef.set(standardizedData);
+        console.log(`Created new user document for: ${userId}`);
       }
       
       return userId;

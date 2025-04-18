@@ -254,18 +254,29 @@ const initiateOuraOAuth = async (req, res) => {
     if (!userDoc.exists) {
       logger.error(`User not found in Firestore before OAuth: ${userId}`, { requestId });
       
-      // Try to create the user document if it doesn't exist using consistent helper
+      // Verify this is a legitimate Firebase Auth user before creating a document
       try {
-        await firestoreUtils.ensureUserDocument(userId, {
-          displayName: 'User',  // Default display name
-          isAdmin: false,       // Default non-admin
-          isActive: true,       // Default active
-          roles: ['user']       // Default role
-        });
-        logger.info(`Created missing user document for: ${userId} with consistent structure`, { requestId });
-      } catch (createError) {
-        logger.error(`Failed to create missing user document: ${userId}`, { requestId, error: createError });
-        return res.status(500).json({ error: 'Failed to prepare user account for OAuth' });
+        logger.info(`Checking if user exists in Firebase Auth: ${userId}`, { requestId });
+        const authUser = await admin.auth().getUser(userId);
+        
+        if (authUser) {
+          // Create user document with proper data from Firebase Auth
+          await firestoreUtils.ensureUserDocument(userId, {
+            email: authUser.email || '',
+            displayName: authUser.displayName || 'User',
+            username: authUser.email ? authUser.email.split('@')[0] : userId.substring(0, 8),
+            isAdmin: false,  // Default non-admin
+            isActive: true,  // Default active
+            roles: ['user']  // Default role
+          });
+          logger.info(`Created missing user document for Firebase Auth user: ${userId}`, { requestId });
+        } else {
+          // This shouldn't happen as we just verified the user exists in Auth
+          throw new Error('User not found in Firebase Auth');
+        }
+      } catch (authError) {
+        logger.error(`User not found in Firebase Auth: ${userId}`, { requestId, error: authError });
+        return res.status(500).json({ error: 'Failed to prepare user account for OAuth - User not found in authentication system' });
       }
     }
 
@@ -417,22 +428,32 @@ const handleOuraOAuthCallback = async (req, res) => {
       if (!userDocSnapshot.exists) {
         logger.error(`User not found before transaction: ${userId}`, { requestId });
         
-        // Try to create the user record using our consistent helper function
+        // Instead of creating a new user document, check if this is a Firebase Auth user
         try {
-          logger.info(`Attempting to create missing user document for: ${userId}`, { requestId });
-          await firestoreUtils.ensureUserDocument(userId, {
-            displayName: 'User',  // Default display name
-            isAdmin: false,  // Default non-admin
-            isActive: true,  // Default active
-            roles: ['user']  // Default role
-          });
-          logger.info(`Created missing user document for: ${userId} with consistent structure`, { requestId });
-        } catch (createError) {
-          logger.error(`Failed to create missing user document: ${userId}`, { requestId, error: createError });
+          logger.info(`Checking if user exists in Firebase Auth: ${userId}`, { requestId });
+          const authUser = await admin.auth().getUser(userId);
           
+          if (authUser) {
+            logger.info(`User exists in Firebase Auth but not in Firestore: ${userId}`, { requestId });
+            // Create user document with proper data from Firebase Auth
+            await firestoreUtils.ensureUserDocument(userId, {
+              email: authUser.email || '',
+              displayName: authUser.displayName || 'User',
+              username: authUser.email ? authUser.email.split('@')[0] : userId.substring(0, 8),
+              isAdmin: false,  // Default non-admin
+              isActive: true,  // Default active
+              roles: ['user']  // Default role
+            });
+            logger.info(`Created missing user document for Firebase Auth user: ${userId}`, { requestId });
+          } else {
+            // This shouldn't happen as we just verified the user exists in Auth
+            throw new Error('User not found in Firebase Auth');
+          }
+        } catch (authError) {
+          logger.error(`User not found in Firebase Auth: ${userId}`, { requestId, error: authError });
           const redirectUrl = new URL(process.env.FRONTEND_URL);
           redirectUrl.searchParams.append('status', 'error');
-          redirectUrl.searchParams.append('message', 'User not found');
+          redirectUrl.searchParams.append('message', 'User account not found');
           return res.redirect(redirectUrl.toString());
         }
       }
@@ -467,9 +488,14 @@ const handleOuraOAuthCallback = async (req, res) => {
         const expiresInMs = (tokenResponse.expires_in - 300) * 1000; // 5 minutes safety margin
         const expiryDate = new Date(Date.now() + expiresInMs);
         
+        // Get the existing user data from the current transaction
+        const currentUserData = userDoc.data();
+        
+        // Create updated Oura integration object, preserving any existing fields
         const ouraIntegration = {
+          ...(currentUserData.ouraIntegration || {}),
           connected: true,
-          lastSyncDate: null,
+          lastSyncDate: currentUserData.ouraIntegration?.lastSyncDate || null,
           connectedAt: new Date(),
           accessToken: encryptedAccessToken,
           refreshToken: encryptedRefreshToken,
@@ -485,7 +511,8 @@ const handleOuraOAuthCallback = async (req, res) => {
           ouraIntegration.userId = tokenResponse.user_id; // Oura user ID, not your app's user ID
         }
         
-        // Update the user document in the transaction (totally replace the ouraIntegration object)
+        // Update the user document in the transaction (update just the ouraIntegration object)
+        // Importantly, don't overwrite any other fields like roles or isAdmin
         transaction.update(userRef, {
           ouraIntegration: ouraIntegration,
           updatedAt: admin.firestore.FieldValue.serverTimestamp()
