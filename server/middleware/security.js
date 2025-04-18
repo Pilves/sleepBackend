@@ -37,42 +37,11 @@ const configureSecurityMiddleware = (app) => {
   }));
 
 
-  // CORS configuration
-  // Get allowed origins from environment variables for more flexibility
-  // Default to development origins if not specified
-  const getAllowedOrigins = () => {
-    if (process.env.NODE_ENV === 'production') {
-      const prodOrigins = process.env.ALLOWED_ORIGINS || 'https://pilves.github.io';
-      return prodOrigins.split(',').map(origin => origin.trim());
-    } else {
-      const devOrigins = process.env.DEV_ALLOWED_ORIGINS || 'http://localhost:5173,http://localhost:5000,http://localhost:3000';
-      return devOrigins.split(',').map(origin => origin.trim());
-    }
-  };
-
+  // Simplified CORS configuration
   const corsOptions = {
-    origin: function (origin, callback) {
-      const allowedOrigins = getAllowedOrigins();
-      
-      // Allow requests with no origin (like mobile apps or curl requests)
-      if (!origin) return callback(null, true);
-      
-      // In production, explicitly allow the frontend origins
-      if (process.env.NODE_ENV === 'production') {
-        const allowedOrigins = getAllowedOrigins();
-        if (allowedOrigins.includes(origin)) {
-          callback(null, true);
-        } else {
-          console.warn(`Origin ${origin} not allowed by CORS policy. Allowed origins:`, allowedOrigins);
-          callback(new Error(`CORS not allowed for origin: ${origin}`), false);
-        }
-      } else {
-        // In development, allow all origins
-        callback(null, true);
-      }
-    },
+    origin: 'https://pilves.github.io',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'DNT', 'User-Agent', 'X-Requested-With', 'If-Modified-Since', 'Cache-Control', 'Content-Type', 'Range'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'DNT', 'User-Agent', 'X-Requested-With', 'If-Modified-Since', 'Cache-Control', 'Range'],
     credentials: true,
     exposedHeaders: ['Content-Length', 'Content-Range'],
     maxAge: 86400 // 24 hours
@@ -81,8 +50,13 @@ const configureSecurityMiddleware = (app) => {
   // Apply CORS middleware
   app.use(cors(corsOptions));
   
-  // Handle preflight requests
-  app.options('*', cors(corsOptions));
+  // Handle preflight requests explicitly
+  app.options('*', (req, res) => {
+    res.header('Access-Control-Allow-Origin', 'https://pilves.github.io');
+    res.header('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Content-Length, X-Requested-With');
+    res.status(200).send();
+  });
 
   // HTTPS redirection removed as we're no longer using Nginx
 
