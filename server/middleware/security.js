@@ -57,16 +57,18 @@ const configureSecurityMiddleware = (app) => {
       // Allow requests with no origin (like mobile apps or curl requests)
       if (!origin) return callback(null, true);
       
-      // Always explicitly add the frontend origin 'https://pilves.github.io' to allowed origins
-      if (allowedOrigins.indexOf(origin) !== -1 || 
-          origin === 'https://pilves.github.io' || 
-          process.env.NODE_ENV !== 'production') {
-        callback(null, true);
+      // In production, explicitly allow the frontend origins
+      if (process.env.NODE_ENV === 'production') {
+        const allowedOrigins = ['https://pilves.github.io'];
+        if (allowedOrigins.includes(origin)) {
+          callback(null, true);
+        } else {
+          console.warn(`Origin ${origin} not allowed by CORS policy. Allowed origins:`, allowedOrigins);
+          callback(null, true); // Currently allowing all origins for troubleshooting
+        }
       } else {
-        console.warn(`Origin ${origin} not allowed by CORS policy. Allowed origins:`, allowedOrigins);
-        // For troubleshooting, temporarily allow all origins
+        // In development, allow all origins
         callback(null, true);
-        // When fixed, revert to: callback(new Error('Not allowed by CORS'));
       }
     },
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
