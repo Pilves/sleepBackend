@@ -501,14 +501,16 @@ const handleOuraOAuthCallback = async (req, res) => {
           refreshToken: encryptedRefreshToken,
           expiresAt: expiryDate,
           lastRefreshed: new Date(),
-          tokenInvalid: false
+          tokenInvalid: false,
+          appUserId: userId // Explicitly store our app's user ID to ensure correct association
         };
         
         logger.info(`Setting Oura token expiry for user ${userId} to ${expiryDate.toISOString()}`, { requestId });
         
-        // Add user_id field only if it exists in the token response
+        // Add Oura's user_id field (rename to ouraUserId for clarity)
         if (tokenResponse.user_id) {
-          ouraIntegration.userId = tokenResponse.user_id; // Oura user ID, not your app's user ID
+          ouraIntegration.ouraUserId = tokenResponse.user_id; // Oura's user ID
+          logger.info(`Stored Oura's user_id (${tokenResponse.user_id}) as ouraUserId for app user ${userId}`, { requestId });
         }
         
         // Update the user document in the transaction (update just the ouraIntegration object)
