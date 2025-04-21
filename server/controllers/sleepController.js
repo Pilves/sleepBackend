@@ -1,11 +1,11 @@
 const admin = require('firebase-admin');
 const moment = require('moment');
-const { v4: uuidv4 } = require('uuid'); // Use specific import for clarity
+const { v4: uuidv4 } = require('uuid'); 
 
 // Import models and utilities
 const SleepData = require('../model/SleepData');
 const SleepSummary = require('../model/SleepSummary');
-const User = require('../model/User'); // Assuming User model is used for type hinting/reference
+const User = require('../model/User');
 const firestoreUtilsFactory = require('../utils/firestoreUtils');
 const ouraOAuth = require('../utils/ouraOAuth');
 const { logger } = require("../utils/logger");
