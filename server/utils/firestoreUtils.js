@@ -273,10 +273,19 @@ module.exports = (firestore) => {
         
         // Special handling for Oura integration to prevent overwriting entire object
         if (userData.ouraIntegration && existingData.ouraIntegration) {
+          console.log(`Merging Oura integration data for user ${userId}`);
+          console.log(`Existing lastSyncDate: ${existingData.ouraIntegration.lastSyncDate}`);
+          console.log(`New lastSyncDate: ${userData.ouraIntegration.lastSyncDate}`);
+          
+          // Create a deep merge to ensure we don't lose any nested properties
           updateData.ouraIntegration = {
             ...existingData.ouraIntegration,
-            ...userData.ouraIntegration
+            ...userData.ouraIntegration,
+            // Ensure the lastSyncDate is properly preserved from the new data if it exists
+            lastSyncDate: userData.ouraIntegration.lastSyncDate || existingData.ouraIntegration.lastSyncDate
           };
+          
+          console.log(`Merged lastSyncDate: ${updateData.ouraIntegration.lastSyncDate}`);
         }
         
         // Update the document, merging with existing data
@@ -313,8 +322,19 @@ module.exports = (firestore) => {
   async function saveUser(user) {
     // If user has an ID, use ensureUserDocument for consistency
     if (user.id) {
-      return ensureUserDocument(user.id, user.toFirestore ? user.toFirestore() : user);
+      console.log(`Saving user with ID: ${user.id}`);
+      
+      // Log important properties before saving
+      if (user.ouraIntegration) {
+        console.log(`User ouraIntegration status: ${user.ouraIntegration.connected}, lastSyncDate: ${user.ouraIntegration.lastSyncDate}`);
+      }
+      
+      // Always use merge=true to prevent overwriting existing data
+      return ensureUserDocument(user.id, user.toFirestore ? user.toFirestore() : user, true);
     }
+    
+    // If no ID, log warning as we should always have an ID at this point
+    console.warn('Attempting to save user without ID:', user);
     
     // Otherwise use generic document save
     return saveDocument('users', user);

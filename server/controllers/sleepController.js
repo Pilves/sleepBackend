@@ -18,6 +18,8 @@ const syncOuraData = async (req, res) => {
 
   try {
     const userId = req.userId;
+    
+    logger.info(`Starting Oura data sync for user ID: ${userId}`);
 
     // Get user's Oura integration details
     const user = await firestoreUtils.getUser(userId);
@@ -26,6 +28,9 @@ const syncOuraData = async (req, res) => {
       logger.error(`User not found in syncOuraData: ${userId}`);
       return res.status(404).json({ error: 'User not found' });
     }
+    
+    // Ensure user ID is properly set
+    user.id = userId;
     
     logger.info(`Syncing sleep data for user: ${userId}, ouraIntegration status: ${user.ouraIntegration?.connected}`);
 
@@ -266,7 +271,16 @@ const syncOuraData = async (req, res) => {
 
       // Update lastSyncDate to track when data was last synced
       user.ouraIntegration.lastSyncDate = new Date();
-      await firestoreUtils.saveUser(user);
+      
+      // Make sure we're properly saving the user with the updated lastSyncDate
+      try {
+        logger.info(`Updating user ${userId} with new lastSyncDate: ${user.ouraIntegration.lastSyncDate}`);
+        await firestoreUtils.saveUser(user);
+        logger.info(`Successfully updated lastSyncDate for user ${userId}`);
+      } catch (userUpdateError) {
+        logger.error(`Failed to update lastSyncDate for user ${userId}:`, userUpdateError);
+        // Continue processing - this shouldn't fail the overall sync
+      }
 
       // Update sleep summaries
       await updateSleepSummaries(userId);
