@@ -19,7 +19,7 @@ const syncOuraData = async (req, res) => {
   try {
     const userId = req.userId;
 
-    // Get user's Oura integration details
+    // Get user's Oura integration details from existing user
     const user = await firestoreUtils.getUser(userId);
 
     if (!user) {
@@ -185,8 +185,15 @@ if (!expiryTime || now > expiryTime) {
         logger.error(`Mismatch between current user (${userId}) and stored appUserId (${user.ouraIntegration.appUserId})`);
         // Fix the mismatch by updating the user record
         user.ouraIntegration.appUserId = userId;
-        await firestoreUtils.saveUser(user);
-        logger.info(`Fixed user ID mismatch by updating appUserId to ${userId}`);
+        
+        // Use direct update on specific field to prevent overwriting entire user document
+        const userRef = firestore.collection('users').doc(userId);
+        await userRef.update({
+          'ouraIntegration.appUserId': userId,
+          'updatedAt': admin.firestore.FieldValue.serverTimestamp()
+        });
+        
+        logger.info(`Fixed user ID mismatch by updating appUserId to ${userId} using direct field update`);
       }
       
       // Map Oura data to our format, explicitly passing the current userId
@@ -304,10 +311,15 @@ if (!expiryTime || now > expiryTime) {
       // Commit all the changes
       await batch.commit();
 
-      // Update last sync date
-      user.ouraIntegration.lastSyncDate = new Date();
-      await firestoreUtils.saveUser(user);
-
+      // Update last sync date using direct field update to prevent creating a new user
+      const userRef = firestore.collection('users').doc(userId);
+      await userRef.update({
+        'ouraIntegration.lastSyncDate': new Date(),
+        'updatedAt': admin.firestore.FieldValue.serverTimestamp()
+      });
+      
+      logger.info(`Updated lastSyncDate for user ${userId} using direct field update`);
+      
       // Update sleep summaries
       await updateSleepSummaries(userId);
 
