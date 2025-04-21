@@ -22,7 +22,7 @@ coverage/
 
 # Git files
 .git
-.gitignore
+../.gitignore
 
 # Docker files
 Dockerfile
