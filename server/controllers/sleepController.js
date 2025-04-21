@@ -19,7 +19,7 @@ const syncOuraData = async (req, res) => {
   try {
     const userId = req.userId;
 
-    // Get user's Oura integration details from existing user
+    // Get user's Oura integration details
     const user = await firestoreUtils.getUser(userId);
 
     if (!user) {
@@ -48,79 +48,80 @@ const syncOuraData = async (req, res) => {
     const timeToExpiry = expiryTime ? (expiryTime - now) / 1000 / 60 : 'unknown'; // minutes
     logger.info(`Oura token for user ${userId} expires in ${timeToExpiry} minutes`);
     
-// Check if expiry exists and it's in the past
-if (!expiryTime || now > expiryTime) {
-  logger.info(`Refreshing expired Oura token for user: ${userId}`);
+    // Check if expiry exists and it's in the past
+    if (!expiryTime || now > expiryTime) {
+      logger.info(`Refreshing expired Oura token for user: ${userId}`);
 
-  try {
-    const tokenResponse = await ouraOAuth.refreshAccessToken(user.ouraIntegration.refreshToken);
+      try {
+        const tokenResponse = await ouraOAuth.refreshAccessToken(user.ouraIntegration.refreshToken);
 
-    // Update tokens
-    accessToken = ouraOAuth.encryptData(tokenResponse.access_token);
-    const refreshToken = ouraOAuth.encryptData(tokenResponse.refresh_token);
-    
-    // Calculate new expiration time - subtract 5 minutes for safety
-    const expiresInMs = (tokenResponse.expires_in - 300) * 1000;
-    const newExpiryTime = new Date(now.getTime() + expiresInMs);
-    
-    // Log the new token details
-    logger.info(`New Oura token for user ${userId} will expire at ${newExpiryTime.toISOString()}`);
+        // Update tokens
+        accessToken = ouraOAuth.encryptData(tokenResponse.access_token);
+        const refreshToken = ouraOAuth.encryptData(tokenResponse.refresh_token);
+        
+        // Calculate new expiration time - subtract 5 minutes for safety
+        const expiresInMs = (tokenResponse.expires_in - 300) * 1000;
+        const newExpiryTime = new Date(now.getTime() + expiresInMs);
+        
+        // Log the new token details
+        logger.info(`New Oura token for user ${userId} will expire at ${newExpiryTime.toISOString()}`);
 
-    // CRITICAL FIX: Use direct update on specific fields instead of saving entire user object
-    const userRef = firestore.collection('users').doc(userId);
-    await userRef.update({
-      'ouraIntegration.accessToken': accessToken,
-      'ouraIntegration.refreshToken': refreshToken,
-      'ouraIntegration.expiresAt': newExpiryTime, // Fixed variable name from expiresAt to newExpiryTime
-      'ouraIntegration.lastRefreshed': now,
-      'ouraIntegration.tokenInvalid': false, 
-      'updatedAt': admin.firestore.FieldValue.serverTimestamp() // Fixed typo FiledValue to FieldValue
-    });
-    
-    logger.info(`Updated user ${userId} with new Oura tokens using direct update`);
-    
-    // Update local user object for continued use in this function
-    user.ouraIntegration.accessToken = accessToken;
-    user.ouraIntegration.refreshToken = refreshToken;
-    user.ouraIntegration.expiresAt = newExpiryTime;
-    user.ouraIntegration.lastRefreshed = now;
-    user.ouraIntegration.tokenInvalid = false;
-  } catch (tokenError) {
-    logger.error(`Failed to refresh Oura token for user ${userId}:`, { 
-      error: tokenError.message,
-      stack: tokenError.stack
-    });
-    
-    // Mark this connection as needing to be reconnected
-    try {
-      // Update user to indicate token is invalid - using direct Firestore update
-      const userRef = firestore.collection('users').doc(userId);
-      await userRef.update({
-        'ouraIntegration.tokenInvalid': true,
-        'updatedAt': admin.firestore.FieldValue.serverTimestamp()
-      });
-      
-      // Also update local user object
-      user.ouraIntegration.tokenInvalid = true;
-      
-      logger.info(`Marked Oura connection as invalid for user ${userId}`);
-    } catch (updateError) {
-      logger.error(`Failed to mark token as invalid for user ${userId}:`, updateError);
+        // Update user record with new tokens
+        user.ouraIntegration.accessToken = accessToken;
+        user.ouraIntegration.refreshToken = refreshToken;
+        user.ouraIntegration.expiresAt = newExpiryTime;
+        user.ouraIntegration.lastRefreshed = now;
+
+        // Save updated user
+        await firestoreUtils.saveUser(user);
+        logger.info(`Updated user ${userId} with new Oura tokens`);
+      } catch (tokenError) {
+        logger.error(`Failed to refresh Oura token for user ${userId}:`, { 
+          error: tokenError.message,
+          stack: tokenError.stack
+        });
+        
+        // Mark this connection as needing to be reconnected
+        try {
+          // Update user to indicate token is invalid
+          user.ouraIntegration.tokenInvalid = true;
+          await firestoreUtils.saveUser(user);
+          logger.info(`Marked Oura connection as invalid for user ${userId}`);
+        } catch (updateError) {
+          logger.error(`Failed to mark token as invalid for user ${userId}:`, updateError);
+        }
+        
+        // Return a more user-friendly response that won't break the app
+        return res.status(200).json({
+          message: 'Oura authorization needs renewal. Please reconnect your Oura ring.',
+          data: [],
+          tokenExpired: true
+        });
+      }
     }
-    
-    // Return a more user-friendly response that won't break the app
-    return res.status(200).json({
-      message: 'Oura authorization needs renewal. Please reconnect your Oura ring.',
-      data: [],
-      tokenExpired: true
-    });
-  }
-}
 
-    // Define sync period: last 30 days
+    // Define sync period based on lastSyncDate or default to 6 months
     const endDate = new Date();
-    const startDate = new Date();
-    startDate.setDate(startDate.getDate() - 30);
+    let startDate;
+    
+    // If user has never synced, get data for last 6 months
+    // Otherwise, get data since last sync (or last 6 months if lastSyncDate is too old)
+    if (!user.ouraIntegration.lastSyncDate) {
+      startDate = new Date();
+      startDate.setMonth(startDate.getMonth() - 6);
+      logger.info(`First sync for user ${userId}, fetching last 6 months of data`);
+    } else {
+      // Use the last sync date or 6 months ago, whichever is more recent
+      const sixMonthsAgo = new Date();
+      sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+      
+      // Get last sync date
+      const lastSync = new Date(user.ouraIntegration.lastSyncDate);
+      
+      // Use lastSyncDate only if it's more recent than 6 months ago
+      startDate = lastSync > sixMonthsAgo ? lastSync : sixMonthsAgo;
+      logger.info(`Using sync start date: ${startDate.toISOString()} for user ${userId}`);
+    }
 
     // Format dates for API
     const formattedStartDate = startDate.toISOString().split('T')[0];
@@ -171,43 +172,11 @@ if (!expiryTime || now > expiryTime) {
         });
       }
 
-      // Log the user's Oura integration details (without sensitive info)
-      logger.info(`User ${userId} Oura integration details:`, {
-        connected: user.ouraIntegration.connected,
-        hasAppUserId: !!user.ouraIntegration.appUserId,
-        appUserId: user.ouraIntegration.appUserId || 'not set',
-        ouraUserId: user.ouraIntegration.ouraUserId || user.ouraIntegration.userId || 'not set',
-        lastSyncDate: user.ouraIntegration.lastSyncDate || 'never'
-      });
-      
-      // Explicitly validate that Oura integration data belongs to this user
-      if (user.ouraIntegration.appUserId && user.ouraIntegration.appUserId !== userId) {
-        logger.error(`Mismatch between current user (${userId}) and stored appUserId (${user.ouraIntegration.appUserId})`);
-        // Fix the mismatch by updating the user record
-        user.ouraIntegration.appUserId = userId;
-        
-        // Use direct update on specific field to prevent overwriting entire user document
-        const userRef = firestore.collection('users').doc(userId);
-        await userRef.update({
-          'ouraIntegration.appUserId': userId,
-          'updatedAt': admin.firestore.FieldValue.serverTimestamp()
-        });
-        
-        logger.info(`Fixed user ID mismatch by updating appUserId to ${userId} using direct field update`);
-      }
-      
-      // Map Oura data to our format, explicitly passing the current userId
+      // Map Oura data to our format
       const ouraData = mapOuraDataToSleepData(response.data.data, userId);
 
       // Log and validate the mapped data
       logger.info(`Mapped ${ouraData.length} Oura records to sleep data format for user ${userId}`);
-      
-      // Additional validation to ensure all mapped data has correct userId
-      const invalidUserIdRecords = ouraData.filter(record => record.userId !== userId);
-      if (invalidUserIdRecords.length > 0) {
-        logger.warn(`Found ${invalidUserIdRecords.length} records with incorrect userId, fixing...`);
-        invalidUserIdRecords.forEach(record => record.userId = userId);
-      }
       
       if (ouraData.length === 0) {
         logger.warn(`No valid sleep data records mapped from Oura for user ${userId}`);
@@ -259,7 +228,7 @@ if (!expiryTime || now > expiryTime) {
           if (!parentDoc.exists) {
             logger.info(`Creating parent sleep data document for user ${userId}`);
             await parentRef.set({
-              userId,  // Explicitly set userId to ensure correct association
+              userId,
               createdAt: admin.firestore.FieldValue.serverTimestamp(),
               lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
               totalRecords: 0,
@@ -268,35 +237,19 @@ if (!expiryTime || now > expiryTime) {
                 lastDate: sleepRecord.date
               }
             });
-            
-            logger.info(`Verified new parent document userId: ${userId}`);
-          } else {
-            // Verify the parent document has the correct userId
-            const parentData = parentDoc.data();
-            if (parentData.userId !== userId) {
-              logger.warn(`Parent document has incorrect userId: ${parentData.userId}, should be: ${userId}. Correcting.`);
-              await parentRef.update({ userId: userId });
-            }
           }
           
-          // Add the sleep data document to batch with explicit userId
+          // Add the sleep data document to batch
           const docRef = firestore
             .collection('sleepData')
             .doc(userId)
             .collection('daily')
             .doc(sleepRecord.dateId);
 
-          // Ensure the userId is explicitly set in the document
-          const sleepDataWithUserId = {
-            ...sleepData.toFirestore(),
-            userId: userId  // Ensure the userId is correctly set in each document
-          };
+          batch.set(docRef, sleepData.toFirestore(), { merge: true });
           
-          batch.set(docRef, sleepDataWithUserId, { merge: true });
-          
-          // Also update the parent document metadata with explicit userId to prevent overwrites
+          // Also update the parent document metadata
           batch.update(parentRef, {
-            userId: userId,  // Explicitly set userId again to ensure it's not overwritten
             totalRecords: admin.firestore.FieldValue.increment(1),
             lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
             'dateRange.lastDate': admin.firestore.FieldValue.serverTimestamp()
@@ -311,15 +264,10 @@ if (!expiryTime || now > expiryTime) {
       // Commit all the changes
       await batch.commit();
 
-      // Update last sync date using direct field update to prevent creating a new user
-      const userRef = firestore.collection('users').doc(userId);
-      await userRef.update({
-        'ouraIntegration.lastSyncDate': new Date(),
-        'updatedAt': admin.firestore.FieldValue.serverTimestamp()
-      });
-      
-      logger.info(`Updated lastSyncDate for user ${userId} using direct field update`);
-      
+      // Update lastSyncDate to track when data was last synced
+      user.ouraIntegration.lastSyncDate = new Date();
+      await firestoreUtils.saveUser(user);
+
       // Update sleep summaries
       await updateSleepSummaries(userId);
 
@@ -356,14 +304,6 @@ const mapOuraDataToSleepData = (ouraData, userId) => {
     logger.error('Invalid ouraData provided to mapOuraDataToSleepData');
     return [];
   }
-  
-  // Validate userId is provided and valid
-  if (!userId) {
-    logger.error('No userId provided to mapOuraDataToSleepData, data will not be associated correctly');
-    return [];
-  }
-  
-  logger.info(`Mapping Oura data to sleep data for user: ${userId}`);
 
   // Log the complete structure of the first record for debugging
   if (ouraData.length > 0) {
