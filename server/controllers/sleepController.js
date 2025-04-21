@@ -32,7 +32,13 @@ const syncOuraData = async (req, res) => {
     // Ensure user ID is properly set
     user.id = userId;
     
-    logger.info(`Syncing sleep data for user: ${userId}, ouraIntegration status: ${user.ouraIntegration?.connected}`);
+    // Ensure ouraIntegration exists to avoid null reference errors
+    if (!user.ouraIntegration) {
+      logger.warn(`User ${userId} has no ouraIntegration object, initializing empty one`);
+      user.ouraIntegration = { connected: false };
+    }
+    
+    logger.info(`Syncing sleep data for user: ${userId}, ouraIntegration status: ${user.ouraIntegration.connected}`);
 
     if (!user.ouraIntegration || !user.ouraIntegration.connected ||
         !user.ouraIntegration.accessToken || !user.ouraIntegration.refreshToken) {
@@ -115,16 +121,36 @@ const syncOuraData = async (req, res) => {
       startDate = new Date();
       startDate.setMonth(startDate.getMonth() - 6);
       logger.info(`First sync for user ${userId}, fetching last 6 months of data`);
+      
+      // Debug: Check if lastSyncDate exists but is invalid
+      logger.info(`lastSyncDate value check: type=${typeof user.ouraIntegration.lastSyncDate}, value=${user.ouraIntegration.lastSyncDate}`);
     } else {
       // Use the last sync date or 6 months ago, whichever is more recent
       const sixMonthsAgo = new Date();
       sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
       
-      // Get last sync date
-      const lastSync = new Date(user.ouraIntegration.lastSyncDate);
+      // Get last sync date - make sure to handle both string and Date object formats
+      let lastSync;
+      if (typeof user.ouraIntegration.lastSyncDate === 'string') {
+        lastSync = new Date(user.ouraIntegration.lastSyncDate);
+        logger.info(`Converted string lastSyncDate to Date: ${lastSync}`);
+      } else if (user.ouraIntegration.lastSyncDate instanceof Date) {
+        lastSync = user.ouraIntegration.lastSyncDate;
+        logger.info(`Using Date object lastSyncDate: ${lastSync}`);
+      } else {
+        // Fall back to 6 months if we can't parse the date
+        logger.warn(`Invalid lastSyncDate format: ${typeof user.ouraIntegration.lastSyncDate}, falling back to 6 months`);
+        lastSync = sixMonthsAgo;
+      }
       
-      // Use lastSyncDate only if it's more recent than 6 months ago
-      startDate = lastSync > sixMonthsAgo ? lastSync : sixMonthsAgo;
+      // Use lastSyncDate only if it's more recent than 6 months ago and is valid
+      if (isNaN(lastSync.getTime())) {
+        logger.warn(`Invalid date in lastSyncDate: ${user.ouraIntegration.lastSyncDate}, falling back to 6 months`);
+        startDate = sixMonthsAgo;
+      } else {
+        startDate = lastSync > sixMonthsAgo ? lastSync : sixMonthsAgo;
+      }
+      
       logger.info(`Using sync start date: ${startDate.toISOString()} for user ${userId}`);
     }
 
@@ -183,6 +209,11 @@ const syncOuraData = async (req, res) => {
       // Log and validate the mapped data
       logger.info(`Mapped ${ouraData.length} Oura records to sleep data format for user ${userId}`);
       
+      // Debug: Log first record after mapping if available
+      if (ouraData.length > 0) {
+        logger.info(`First mapped record sample:`, JSON.stringify(ouraData[0], null, 2));
+      }
+      
       if (ouraData.length === 0) {
         logger.warn(`No valid sleep data records mapped from Oura for user ${userId}`);
         return res.status(200).json({
@@ -192,94 +223,136 @@ const syncOuraData = async (req, res) => {
       }
 
       // Process and store the data
-      const batch = firestore.batch();
+      // Use smaller batches to avoid potential issues with large batches
       let processedCount = 0;
       let errorCount = 0;
-
-      for (const sleepRecord of ouraData) {
-        try {
-          // Create a sleep data model with validation
-          const sleepData = new SleepData({
-            userId,
-            dateId: sleepRecord.dateId,
-            date: sleepRecord.date,
-            ouraScore: sleepRecord.ouraScore,
-            metrics: sleepRecord.metrics,
-            tags: [],
-            notes: ''
-          });
-
-          // Validate the sleep data
-          const validation = sleepData.validate();
-          if (!validation.valid) {
-            logger.warn(`Invalid sleep data record for user ${userId}, date ${sleepRecord.dateId}:`, 
-              { errors: validation.errors });
-            errorCount++;
-            continue;
+      const BATCH_SIZE = 20; // Process in smaller batches of 20 records
+      
+      // Log how many records we're about to process
+      logger.info(`Processing ${ouraData.length} sleep records in batches for user ${userId}`);
+      
+      // First, ensure the parent document exists
+      const parentRef = firestore.collection('sleepData').doc(userId);
+      const parentDoc = await parentRef.get();
+      
+      if (!parentDoc.exists) {
+        logger.info(`Creating parent sleep data document for user ${userId}`);
+        await parentRef.set({
+          userId,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+          totalRecords: 0,
+          dateRange: {
+            firstDate: ouraData.length > 0 ? ouraData[0].date : new Date(),
+            lastDate: ouraData.length > 0 ? ouraData[ouraData.length - 1].date : new Date()
           }
-
-          // Get existing data to preserve any notes and tags
-          const existingData = await firestoreUtils.getSleepData(userId, sleepRecord.dateId);
-          if (existingData) {
-            sleepData.tags = existingData.tags || [];
-            sleepData.notes = existingData.notes || '';
-          }
-
-          // Ensure the parent document exists first with proper data
-          // We'll do this outside the batch for robustness
-          const parentRef = firestore.collection('sleepData').doc(userId);
-          const parentDoc = await parentRef.get();
-          
-          if (!parentDoc.exists) {
-            logger.info(`Creating parent sleep data document for user ${userId}`);
-            await parentRef.set({
+        });
+        logger.info(`Parent sleep data document created for user ${userId}`);
+      }
+      
+      // Process in smaller batches
+      for (let i = 0; i < ouraData.length; i += BATCH_SIZE) {
+        const batch = firestore.batch();
+        const currentBatch = ouraData.slice(i, i + BATCH_SIZE);
+        
+        logger.info(`Processing batch ${Math.floor(i/BATCH_SIZE) + 1} with ${currentBatch.length} records for user ${userId}`);
+        
+        for (const sleepRecord of currentBatch) {
+          try {
+            // Create a sleep data model with validation
+            const sleepData = new SleepData({
               userId,
-              createdAt: admin.firestore.FieldValue.serverTimestamp(),
-              lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
-              totalRecords: 0,
-              dateRange: {
-                firstDate: sleepRecord.date,
-                lastDate: sleepRecord.date
-              }
+              dateId: sleepRecord.dateId,
+              date: sleepRecord.date,
+              ouraScore: sleepRecord.ouraScore,
+              metrics: sleepRecord.metrics,
+              tags: [],
+              notes: ''
             });
+  
+            // Validate the sleep data
+            const validation = sleepData.validate();
+            if (!validation.valid) {
+              logger.warn(`Invalid sleep data record for user ${userId}, date ${sleepRecord.dateId}:`, 
+                { errors: validation.errors });
+              errorCount++;
+              continue;
+            }
+  
+            // Get existing data to preserve any notes and tags
+            const existingData = await firestoreUtils.getSleepData(userId, sleepRecord.dateId);
+            if (existingData) {
+              sleepData.tags = existingData.tags || [];
+              sleepData.notes = existingData.notes || '';
+              logger.info(`Preserving existing tags/notes for date ${sleepRecord.dateId}`);
+            }
+  
+            // Add the sleep data document to batch
+            const docRef = firestore
+              .collection('sleepData')
+              .doc(userId)
+              .collection('daily')
+              .doc(sleepRecord.dateId);
+  
+            // Debug log the sleep data object before saving
+            logger.info(`Saving sleep data for date ${sleepRecord.dateId}, score: ${sleepData.ouraScore}`);
+            
+            batch.set(docRef, sleepData.toFirestore(), { merge: true });
+            
+            // Also update the parent document metadata
+            batch.update(parentRef, {
+              totalRecords: admin.firestore.FieldValue.increment(1),
+              lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+              'dateRange.lastDate': sleepRecord.date
+            });
+            processedCount++;
+          } catch (recordError) {
+            logger.error(`Error processing sleep record for date ${sleepRecord?.dateId}:`, recordError);
+            errorCount++;
           }
-          
-          // Add the sleep data document to batch
-          const docRef = firestore
-            .collection('sleepData')
-            .doc(userId)
-            .collection('daily')
-            .doc(sleepRecord.dateId);
-
-          batch.set(docRef, sleepData.toFirestore(), { merge: true });
-          
-          // Also update the parent document metadata
-          batch.update(parentRef, {
-            totalRecords: admin.firestore.FieldValue.increment(1),
-            lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
-            'dateRange.lastDate': admin.firestore.FieldValue.serverTimestamp()
-          });
-          processedCount++;
-        } catch (recordError) {
-          logger.error(`Error processing sleep record for date ${sleepRecord?.dateId}:`, recordError);
-          errorCount++;
+        }
+  
+        // Commit the current batch
+        try {
+          await batch.commit();
+          logger.info(`Successfully committed batch ${Math.floor(i/BATCH_SIZE) + 1} for user ${userId}, processed: ${currentBatch.length} records`);
+        } catch (batchError) {
+          logger.error(`Error committing batch ${Math.floor(i/BATCH_SIZE) + 1} for user ${userId}:`, batchError);
+          // Do not stop processing on batch error, continue with next batch
+          errorCount += currentBatch.length;
         }
       }
 
-      // Commit all the changes
-      await batch.commit();
-
       // Update lastSyncDate to track when data was last synced
-      user.ouraIntegration.lastSyncDate = new Date();
+      // Explicitly create a new date and convert to ISO string for consistent handling
+      const newSyncDate = new Date();
       
-      // Make sure we're properly saving the user with the updated lastSyncDate
+      // Make a direct update to the user document to ensure the lastSyncDate is properly stored
       try {
-        logger.info(`Updating user ${userId} with new lastSyncDate: ${user.ouraIntegration.lastSyncDate}`);
-        await firestoreUtils.saveUser(user);
-        logger.info(`Successfully updated lastSyncDate for user ${userId}`);
-      } catch (userUpdateError) {
-        logger.error(`Failed to update lastSyncDate for user ${userId}:`, userUpdateError);
-        // Continue processing - this shouldn't fail the overall sync
+        logger.info(`Updating user ${userId} with new lastSyncDate: ${newSyncDate.toISOString()}`);
+        
+        // Modify the user object for the upcoming save
+        user.ouraIntegration.lastSyncDate = newSyncDate;
+        
+        // First try using the Firestore API directly for the update
+        const firestore = admin.firestore();
+        await firestore.collection('users').doc(userId).update({
+          'ouraIntegration.lastSyncDate': newSyncDate,
+          'updatedAt': admin.firestore.FieldValue.serverTimestamp()
+        });
+        
+        logger.info(`Successfully updated lastSyncDate directly for user ${userId}`);
+      } catch (directUpdateError) {
+        logger.error(`Failed to update lastSyncDate directly for user ${userId}:`, directUpdateError);
+        
+        // Fallback to using the firestoreUtils helper
+        try {
+          await firestoreUtils.saveUser(user);
+          logger.info(`Successfully updated lastSyncDate via firestoreUtils for user ${userId}`);
+        } catch (userUpdateError) {
+          logger.error(`Failed to update lastSyncDate via helper for user ${userId}:`, userUpdateError);
+          // Continue processing - this shouldn't fail the overall sync
+        }
       }
 
       // Update sleep summaries
