@@ -165,12 +165,42 @@ const syncOuraData = async (req, res) => {
 
     // Fetch data from Oura API
     try {
-      const response = await ouraClient.get('/usercollection/daily_sleep', {
-        params: {
-          start_date: formattedStartDate,
-          end_date: formattedEndDate
-        }
+      // Log the API request details
+      logger.info(`Making Oura API request for sleep data from ${formattedStartDate} to ${formattedEndDate}`, {
+        requestId,
+        endpoint: '/usercollection/daily_sleep',
+        params: { start_date: formattedStartDate, end_date: formattedEndDate }
       });
+      
+      // Try to get the response from Oura API
+      // Oura v2 API uses different endpoints, try the correct one
+      // First attempt the standard v2 endpoint
+      let response;
+      try {
+        logger.info(`Trying Oura API v2 endpoint: /daily_sleep`, { requestId });
+        response = await ouraClient.get('/daily_sleep', {
+          params: {
+            start_date: formattedStartDate,
+            end_date: formattedEndDate
+          }
+        });
+      } catch (v2Error) {
+        // If that fails, try the alternative API path
+        logger.info(`First endpoint failed, trying alternative: /usercollection/daily_sleep`, {
+          requestId,
+          error: v2Error.message
+        });
+        
+        response = await ouraClient.get('/usercollection/daily_sleep', {
+          params: {
+            start_date: formattedStartDate,
+            end_date: formattedEndDate
+          }
+        });
+      }
+      
+      // Log received response status
+      logger.info(`Received Oura API response with status ${response.status}`, { requestId });
 
       // Check if Oura API response has the expected structure
       if (!response.data || !response.data.data || !Array.isArray(response.data.data)) {
@@ -365,11 +395,49 @@ const syncOuraData = async (req, res) => {
         recordsTotal: ouraData.length
       });
     } catch (apiError) {
-      logger.error('Error fetching data from Oura API:', apiError);
-      // Return a non-failing response
+      // Enhanced error logging with more details
+      logger.error('Error fetching data from Oura API:', {
+        error: apiError.message,
+        stack: apiError.stack,
+        code: apiError.code,
+        requestId
+      });
+      
+      // Log the response data if available
+      if (apiError.response) {
+        logger.error('Oura API error response:', {
+          status: apiError.response.status,
+          statusText: apiError.response.statusText,
+          data: JSON.stringify(apiError.response.data).substring(0, 500),
+          requestId
+        });
+        
+        // Specific handling for 401 errors (unauthorized)
+        if (apiError.response.status === 401) {
+          logger.error('Oura API authentication error - token may be invalid', { requestId });
+          // Attempt to mark token as invalid to force re-authentication
+          try {
+            user.ouraIntegration.tokenInvalid = true;
+            await firestoreUtils.saveUser(user);
+            logger.info(`Marked Oura token as invalid for user ${userId}`);
+          } catch (tokenUpdateError) {
+            logger.error(`Failed to mark token as invalid: ${tokenUpdateError.message}`);
+          }
+          
+          return res.status(200).json({
+            message: 'Authentication error with Oura. Please reconnect your Oura ring.',
+            error: 'Oura authentication failed',
+            needsReconnect: true,
+            data: []
+          });
+        }
+      }
+      
+      // Return a more specific error message for debugging purposes
       return res.status(200).json({
-        message: 'Could not fetch data from Oura, but continuing anyway',
+        message: 'Could not fetch data from Oura API',
         error: apiError.message || 'Error accessing Oura API',
+        errorCode: apiError.code,
         data: []
       });
     }
@@ -397,68 +465,169 @@ const mapOuraDataToSleepData = (ouraData, userId) => {
     logger.info(`Full structure of Oura record for mapping reference:`, 
       JSON.stringify(ouraData[0], null, 2).substring(0, 1000));
   }
+  
+  // For debugging
+  logger.info(`Processing ${ouraData.length} Oura records for mapping`);
 
-  return ouraData.map(record => {
-    // Validate required fields
-    if (!record.day) {
-      logger.warn('Skipping Oura record with missing day field', { recordId: record.id });
-      return null;
+  return ouraData.map((record, index) => {
+    // For debugging the first few records
+    if (index < 3) {
+      logger.info(`Processing record ${index + 1}/${ouraData.length}:`, JSON.stringify(record, null, 2));
     }
-
+  
     try {
-      // Get date in YYYY-MM-DD format
-      const dateId = record.day;
-      const date = new Date(record.day);
-
-      if (isNaN(date.getTime())) {
-        logger.warn(`Invalid date in Oura record: ${record.day}`, { recordId: record.id });
+      // Validate and extract date - check both v1 and v2 API formats
+      // v2 API uses 'day', v1 might use 'summary_date' or other fields
+      const dayField = record.day || record.summary_date || record.timestamp_date;
+      
+      if (!dayField) {
+        logger.warn('Skipping Oura record with missing day field', { 
+          recordId: record.id,
+          fields: Object.keys(record).join(', ')
+        });
         return null;
       }
 
-      // The new API format uses 'score' instead of 'sleep_score'
-      // and has durations in the contributors object
-      const sleepScore = Number(record.score || 0);
+      // Get date in YYYY-MM-DD format
+      const dateId = dayField;
+      const date = new Date(dayField);
+
+      if (isNaN(date.getTime())) {
+        logger.warn(`Invalid date in Oura record: ${dayField}`, { recordId: record.id });
+        return null;
+      }
       
-      // Extract metrics from the contributors object if available
-      const contributors = record.contributors || {};
+      // For first record, log detailed field paths for debugging
+      if (index === 0) {
+        logger.info('Detailed field mapping for first record:', {
+          day: dayField,
+          score_paths: {
+            direct_score: record.score,
+            sleep_score: record.sleep_score,
+            score_nested: record.score_nested,
+          },
+          duration_paths: {
+            direct_duration: record.duration,
+            total_sleep_duration: record.total_sleep_duration,
+            deep_sleep_duration: record.deep_sleep_duration,
+            rem_sleep_duration: record.rem_sleep_duration,
+            light_sleep_duration: record.light_sleep_duration,
+          },
+          has_contributors: !!record.contributors
+        });
+      }
+
+      // Handle different API versions - try all possible field paths
+      // 1. Direct fields - for v1 API
+      // 2. Nested contributors - for v2 API
       
-      // Calculate approximate sleep durations from the score percentages
-      // These are estimates since the API doesn't provide exact durations
-      // Average adult needs about 8 hours (28800 seconds) of sleep
-      const totalSleepSeconds = 28800 * (contributors.total_sleep || 90) / 100;
+      // Determine sleep score - try multiple possible field paths
+      let sleepScore = 0;
+      if (typeof record.score === 'number') {
+        // v2 API format
+        sleepScore = record.score;
+      } else if (typeof record.sleep_score === 'number') {
+        // v1 API format
+        sleepScore = record.sleep_score;
+      } else if (record.score_nested && typeof record.score_nested.total === 'number') {
+        // Another possible format
+        sleepScore = record.score_nested.total;
+      } else {
+        // Default fallback - estimate from contributors if available
+        const contributors = record.contributors || {};
+        if (contributors.total_sleep && contributors.deep_sleep && contributors.efficiency) {
+          // Weighted average of key contributors
+          sleepScore = Math.round(
+            (contributors.total_sleep * 0.4) + 
+            (contributors.deep_sleep * 0.3) + 
+            (contributors.efficiency * 0.3)
+          );
+        } else {
+          // Use a default score
+          sleepScore = 70;
+          logger.warn(`Using default sleep score for record ${record.id}`);
+        }
+      }
       
-      // Proportional estimates based on typical sleep stage percentages
-      // Deep sleep: ~15-25% of total sleep
-      const deepSleepSeconds = totalSleepSeconds * 0.20 * (contributors.deep_sleep || 90) / 100;
+      // Determine sleep durations - try both direct fields and contributors
+      let totalSleepSeconds, deepSleepSeconds, remSleepSeconds, lightSleepSeconds, latencySeconds;
       
-      // REM sleep: ~20-25% of total sleep
-      const remSleepSeconds = totalSleepSeconds * 0.22 * (contributors.rem_sleep || 90) / 100;
+      // First try direct duration fields (v1 API format)
+      if (typeof record.total_sleep_duration === 'number') {
+        // Use actual durations if available
+        totalSleepSeconds = record.total_sleep_duration;
+        deepSleepSeconds = record.deep_sleep_duration || 0;
+        remSleepSeconds = record.rem_sleep_duration || 0;
+        lightSleepSeconds = record.light_sleep_duration || 0;
+        latencySeconds = record.onset_latency || 0;
+        
+        logger.info(`Using direct duration fields for record ${record.id || index}`);
+      } 
+      // Then try duration fields inside nested objects
+      else if (record.duration && typeof record.duration.total_sleep === 'number') {
+        totalSleepSeconds = record.duration.total_sleep;
+        deepSleepSeconds = record.duration.deep_sleep || 0;
+        remSleepSeconds = record.duration.rem_sleep || 0;
+        lightSleepSeconds = record.duration.light_sleep || 0;
+        latencySeconds = record.latency || 0;
+        
+        logger.info(`Using nested duration fields for record ${record.id || index}`);
+      }
+      // Finally fall back to estimating from contributors percentages
+      else {
+        // Extract metrics from the contributors object if available
+        const contributors = record.contributors || {};
+        
+        // Calculate approximate sleep durations from the score percentages
+        // These are estimates since the API doesn't provide exact durations
+        // Average adult needs about 8 hours (28800 seconds) of sleep
+        totalSleepSeconds = 28800 * (contributors.total_sleep || 90) / 100;
+        
+        // Proportional estimates based on typical sleep stage percentages
+        // Deep sleep: ~15-25% of total sleep
+        deepSleepSeconds = totalSleepSeconds * 0.20 * (contributors.deep_sleep || 90) / 100;
+        
+        // REM sleep: ~20-25% of total sleep
+        remSleepSeconds = totalSleepSeconds * 0.22 * (contributors.rem_sleep || 90) / 100;
+        
+        // Light sleep: remaining sleep time
+        lightSleepSeconds = totalSleepSeconds - deepSleepSeconds - remSleepSeconds;
+        
+        // Latency estimate based on score (lower score = longer latency, up to 30 minutes)
+        latencySeconds = 1800 * (1 - (contributors.latency || 80) / 100);
+        
+        logger.info(`Using estimated durations from contributors for record ${record.id || index}`);
+      }
       
-      // Light sleep: remaining sleep time
-      const lightSleepSeconds = totalSleepSeconds - deepSleepSeconds - remSleepSeconds;
+      // Get heart rate data if available
+      const hrAvg = record.hr_average || (record.heart_rate && record.heart_rate.average) || 0;
+      const hrLowest = record.hr_lowest || (record.heart_rate && record.heart_rate.lowest) || 0;
       
-      // Latency estimate based on score (lower score = longer latency, up to 30 minutes)
-      const latencySeconds = 1800 * (1 - (contributors.latency || 80) / 100);
+      // Get HRV if available
+      const hrv = record.rmssd || (record.hrv && record.hrv.rmssd) || 0;
+      
+      // Get respiratory rate if available
+      const respRate = record.breath_average || (record.respiratory_rate && record.respiratory_rate.average) || 0;
 
       // Create the mapped sleep data object
-      return {
+      const mappedData = {
         userId,
         dateId,
         date,
-        ouraScore: sleepScore,
+        ouraScore: Math.round(sleepScore), // Ensure it's a whole number
         metrics: {
           totalSleepTime: Math.round(totalSleepSeconds),
-          efficiency: contributors.efficiency || 0,
+          efficiency: (record.efficiency || (record.contributors && record.contributors.efficiency) || 0) * 100,
           deepSleep: Math.round(deepSleepSeconds),
           remSleep: Math.round(remSleepSeconds),
           lightSleep: Math.round(lightSleepSeconds),
           latency: Math.round(latencySeconds),
           heartRate: {
-            average: 0, // Not available in this API response
-            lowest: 0   // Not available in this API response
+            average: hrAvg,
+            lowest: hrLowest
           },
-          hrv: 0,       // Not available in this API response
-          respiratoryRate: 0  // Not available in this API response
+          hrv: hrv,
+          respiratoryRate: respRate
         },
         sourceData: {
           provider: 'oura',
@@ -467,8 +636,20 @@ const mapOuraDataToSleepData = (ouraData, userId) => {
           sourceId: record.id || `generated-${Date.now()}`
         }
       };
+      
+      // Log the first couple of mapped records for debugging
+      if (index < 2) {
+        logger.info(`Mapped record ${index + 1}:`, JSON.stringify(mappedData, null, 2));
+      }
+      
+      return mappedData;
     } catch (error) {
-      logger.error(`Error mapping Oura record:`, { error: error.message, record: JSON.stringify(record) });
+      logger.error(`Error mapping Oura record:`, { 
+        error: error.message, 
+        stack: error.stack,
+        recordIndex: index,
+        record: JSON.stringify(record)
+      });
       return null;
     }
   }).filter(Boolean); // Remove any null entries
