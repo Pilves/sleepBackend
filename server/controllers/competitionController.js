@@ -660,7 +660,7 @@ const updateCompetition = async (req, res) => {
       
       competition.status = updatedStatus.toUpperCase();
     }
-    // Otherwise update status based on dates if dates were changed
+    // Only auto-update status based on dates if status was not explicitly provided
     else if (startDate || endDate) {
       const now = new Date();
 
@@ -833,6 +833,99 @@ const init = (fsUtils) => {
   console.log('Competition controller initialized with Firestore utils');
 };
 
+/**
+ * Update only the status of a competition
+ * This endpoint is available to competition participants, not just admins
+ */
+const updateCompetitionStatus = async (req, res) => {
+  try {
+    const { competitionId } = req.params;
+    const { status } = req.body;
+    const userId = req.userId;
+    const requestId = req.id;
+
+    logger.info(`Updating status for competition: ${competitionId}`, { requestId, userId });
+
+    if (!status) {
+      return res.status(400).json({
+        error: 'Status is required',
+        requestId
+      });
+    }
+
+    // Get the existing competition
+    const competition = await firestoreUtils.getCompetition(competitionId);
+
+    if (!competition) {
+      logger.warn(`Competition not found: ${competitionId}`, { requestId });
+      return res.status(404).json({
+        error: 'Competition not found',
+        requestId
+      });
+    }
+
+    // Don't allow updating if competition is completed
+    if (competition.status === 'COMPLETED') {
+      logger.warn(`Cannot update completed competition: ${competitionId}`, { requestId });
+      return res.status(400).json({
+        error: 'Cannot update a completed competition',
+        requestId
+      });
+    }
+
+    // Check if user is a participant or admin
+    const userDoc = await admin.firestore().collection('users').doc(userId).get();
+    const userData = userDoc.data();
+    const isAdmin = userData && userData.roles && userData.roles.includes('admin');
+    const isParticipant = competition.participants && competition.participants.includes(userId);
+    
+    if (!isAdmin && !isParticipant) {
+      logger.warn(`User ${userId} not authorized to update competition status`, { requestId });
+      return res.status(403).json({
+        error: 'You must be a participant in this competition to update its status',
+        requestId
+      });
+    }
+
+    // Normalize status
+    let updatedStatus = status;
+    if (updatedStatus === 'upcoming') updatedStatus = 'PENDING';
+    if (updatedStatus === 'active') updatedStatus = 'ACTIVE';
+    if (updatedStatus === 'completed') updatedStatus = 'COMPLETED';
+    
+    updatedStatus = updatedStatus.toUpperCase();
+
+    // Validate new status
+    const validStatuses = ['PENDING', 'ACTIVE', 'COMPLETED', 'CANCELLED'];
+    if (!validStatuses.includes(updatedStatus)) {
+      logger.warn(`Invalid status: ${updatedStatus}`, { requestId });
+      return res.status(400).json({
+        error: `Status must be one of: ${validStatuses.join(', ')}`,
+        requestId
+      });
+    }
+
+    // Update the status
+    competition.status = updatedStatus;
+
+    // Save to Firestore
+    await firestoreUtils.saveCompetition(competition);
+
+    logger.info(`Competition ${competitionId} status updated successfully to ${updatedStatus}`, { requestId });
+    return res.status(200).json({
+      message: 'Competition status updated successfully',
+      status: updatedStatus
+    });
+  } catch (error) {
+    logger.error(`Error updating competition ${req.params.competitionId} status:`, error);
+    return res.status(500).json({
+      error: 'Failed to update competition status',
+      message: error.message,
+      requestId: req.id
+    });
+  }
+};
+
 module.exports = {
   init,
   getCompetitions,
@@ -843,5 +936,6 @@ module.exports = {
   getUserCompetitions,
   createCompetition,
   updateCompetition,
+  updateCompetitionStatus,
   updateCompetitionWinners
 };

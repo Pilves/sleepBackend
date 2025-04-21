@@ -76,6 +76,14 @@ module.exports = (firestoreUtils) => {
     competitionController.updateCompetition
   );
 
+  // Update competition status (available to competition participants)
+  router.patch('/:competitionId/status', 
+    authenticate, 
+    validate('competitionId'),
+    validate('updateCompetitionStatus'),
+    competitionController.updateCompetitionStatus
+  );
+
   // Update competition winners
   router.put('/:competitionId/winners', 
     authenticate, 

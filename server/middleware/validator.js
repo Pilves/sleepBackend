@@ -430,6 +430,19 @@ const validationSchemas = {
     }
   },
   
+  // Update competition status schema for PATCH requests
+  updateCompetitionStatus: {
+    status: {
+      in: ['body'],
+      isString: true,
+      isIn: {
+        options: [['PENDING', 'ACTIVE', 'COMPLETED', 'CANCELLED', 
+                  'upcoming', 'active', 'completed']],
+        errorMessage: 'Status must be one of: PENDING, ACTIVE, COMPLETED, CANCELLED, upcoming, active, completed'
+      }
+    }
+  },
+  
   // Notification routes
   notificationPagination: {
     limit: {

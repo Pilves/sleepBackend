@@ -1,623 +1,131 @@
 const admin = require('firebase-admin');
 const moment = require('moment');
+const { v4: uuidv4 } = require('uuid'); // Use specific import for clarity
 
 // Import models and utilities
 const SleepData = require('../model/SleepData');
 const SleepSummary = require('../model/SleepSummary');
-const User = require('../model/User');
+const User = require('../model/User'); // Assuming User model is used for type hinting/reference
 const firestoreUtilsFactory = require('../utils/firestoreUtils');
 const ouraOAuth = require('../utils/ouraOAuth');
-const {logger} = require("../utils/logger");
+const { logger } = require("../utils/logger");
 
-// Initialize with Firestore
+// Initialize with Firestore - populated by init()
 let firestoreUtils;
 
-// Sync sleep data from Oura
-const syncOuraData = async (req, res) => {
-  const firestore = admin.firestore();
+// --- Production Readiness Considerations ---
+// - Environment Variables: Oura credentials, encryption keys should be in env vars/secrets manager.
+// - Input Validation Middleware: Consider dedicated middleware for validating req.params, req.query, req.body.
+// - Rate Limiting: Implement API rate limiting on your endpoints.
+// - Security Audits: Regularly audit dependencies and code for vulnerabilities.
+// - Monitoring & Alerting: Set up monitoring for error rates, latency, and system health.
+// - Testing: Comprehensive unit, integration, and end-to-end tests are crucial.
+// -----------------------------------------
 
-  try {
-    const userId = req.userId;
-    
-    logger.info(`Starting Oura data sync for user ID: ${userId}`);
-
-    // Get user's Oura integration details
-    const user = await firestoreUtils.getUser(userId);
-
-    if (!user) {
-      logger.error(`User not found in syncOuraData: ${userId}`);
-      return res.status(404).json({ error: 'User not found' });
-    }
-    
-    // Ensure user ID is properly set
-    user.id = userId;
-    
-    // Ensure ouraIntegration exists to avoid null reference errors
-    if (!user.ouraIntegration) {
-      logger.warn(`User ${userId} has no ouraIntegration object, initializing empty one`);
-      user.ouraIntegration = { connected: false };
-    }
-    
-    logger.info(`Syncing sleep data for user: ${userId}, ouraIntegration status: ${user.ouraIntegration.connected}`);
-
-    if (!user.ouraIntegration || !user.ouraIntegration.connected ||
-        !user.ouraIntegration.accessToken || !user.ouraIntegration.refreshToken) {
-      // Instead of erroring, return empty data with a message
-      return res.status(200).json({ 
-        message: 'No Oura Ring connected, nothing to sync',
-        data: [],
-        noConnection: true 
-      });
-    }
-
-    // Check if token is expired and refresh if needed
-    let accessToken = user.ouraIntegration.accessToken;
-    const now = new Date();
-    
-    // Log current token expiration info for debugging
-    const expiryTime = user.ouraIntegration.expiresAt;
-    const timeToExpiry = expiryTime ? (expiryTime - now) / 1000 / 60 : 'unknown'; // minutes
-    logger.info(`Oura token for user ${userId} expires in ${timeToExpiry} minutes`);
-    
-    // Check if expiry exists and it's in the past
-    if (!expiryTime || now > expiryTime) {
-      logger.info(`Refreshing expired Oura token for user: ${userId}`);
-
-      try {
-        const tokenResponse = await ouraOAuth.refreshAccessToken(user.ouraIntegration.refreshToken);
-
-        // Update tokens
-        accessToken = ouraOAuth.encryptData(tokenResponse.access_token);
-        const refreshToken = ouraOAuth.encryptData(tokenResponse.refresh_token);
-        
-        // Calculate new expiration time - subtract 5 minutes for safety
-        const expiresInMs = (tokenResponse.expires_in - 300) * 1000;
-        const newExpiryTime = new Date(now.getTime() + expiresInMs);
-        
-        // Log the new token details
-        logger.info(`New Oura token for user ${userId} will expire at ${newExpiryTime.toISOString()}`);
-
-        // Update user record with new tokens
-        user.ouraIntegration.accessToken = accessToken;
-        user.ouraIntegration.refreshToken = refreshToken;
-        user.ouraIntegration.expiresAt = newExpiryTime;
-        user.ouraIntegration.lastRefreshed = now;
-
-        // Save updated user
-        await firestoreUtils.saveUser(user);
-        logger.info(`Updated user ${userId} with new Oura tokens`);
-      } catch (tokenError) {
-        logger.error(`Failed to refresh Oura token for user ${userId}:`, { 
-          error: tokenError.message,
-          stack: tokenError.stack
-        });
-        
-        // Mark this connection as needing to be reconnected
-        try {
-          // Update user to indicate token is invalid
-          user.ouraIntegration.tokenInvalid = true;
-          await firestoreUtils.saveUser(user);
-          logger.info(`Marked Oura connection as invalid for user ${userId}`);
-        } catch (updateError) {
-          logger.error(`Failed to mark token as invalid for user ${userId}:`, updateError);
-        }
-        
-        // Return a more user-friendly response that won't break the app
-        return res.status(200).json({
-          message: 'Oura authorization needs renewal. Please reconnect your Oura ring.',
-          data: [],
-          tokenExpired: true
-        });
-      }
-    }
-
-    // Define sync period based on lastSyncDate or default to 6 months
-    const endDate = new Date();
-    let startDate;
-    
-    // If user has never synced, get data for last 6 months
-    // Otherwise, get data since last sync (or last 6 months if lastSyncDate is too old)
-    if (!user.ouraIntegration.lastSyncDate) {
-      startDate = new Date();
-      startDate.setMonth(startDate.getMonth() - 6);
-      logger.info(`First sync for user ${userId}, fetching last 6 months of data`);
-      
-      // Debug: Check if lastSyncDate exists but is invalid
-      logger.info(`lastSyncDate value check: type=${typeof user.ouraIntegration.lastSyncDate}, value=${user.ouraIntegration.lastSyncDate}`);
-    } else {
-      // Use the last sync date or 6 months ago, whichever is more recent
-      const sixMonthsAgo = new Date();
-      sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
-      
-      // Get last sync date - make sure to handle both string and Date object formats
-      let lastSync;
-      if (typeof user.ouraIntegration.lastSyncDate === 'string') {
-        lastSync = new Date(user.ouraIntegration.lastSyncDate);
-        logger.info(`Converted string lastSyncDate to Date: ${lastSync}`);
-      } else if (user.ouraIntegration.lastSyncDate instanceof Date) {
-        lastSync = user.ouraIntegration.lastSyncDate;
-        logger.info(`Using Date object lastSyncDate: ${lastSync}`);
-      } else {
-        // Fall back to 6 months if we can't parse the date
-        logger.warn(`Invalid lastSyncDate format: ${typeof user.ouraIntegration.lastSyncDate}, falling back to 6 months`);
-        lastSync = sixMonthsAgo;
-      }
-      
-      // Use lastSyncDate only if it's more recent than 6 months ago and is valid
-      if (isNaN(lastSync.getTime())) {
-        logger.warn(`Invalid date in lastSyncDate: ${user.ouraIntegration.lastSyncDate}, falling back to 6 months`);
-        startDate = sixMonthsAgo;
-      } else {
-        startDate = lastSync > sixMonthsAgo ? lastSync : sixMonthsAgo;
-      }
-      
-      logger.info(`Using sync start date: ${startDate.toISOString()} for user ${userId}`);
-    }
-
-    // Format dates for API
-    const formattedStartDate = startDate.toISOString().split('T')[0];
-    const formattedEndDate = endDate.toISOString().split('T')[0];
-
-    // Create Oura client with access token and request ID for tracing
-    const requestId = require('uuid').v4();
-    logger.info(`Starting Oura API request for user ${userId}`, { requestId });
-    const ouraClient = ouraOAuth.createOuraClient(accessToken, requestId);
-
-    // Fetch data from Oura API
-    try {
-      // Log the API request details
-      logger.info(`Making Oura API request for sleep data from ${formattedStartDate} to ${formattedEndDate}`, {
-        requestId,
-        endpoint: '/usercollection/daily_sleep',
-        params: { start_date: formattedStartDate, end_date: formattedEndDate }
-      });
-      
-      // Try to get the response from Oura API
-      // Oura v2 API uses different endpoints, try the correct one
-      // First attempt the standard v2 endpoint
-      let response;
-      try {
-        logger.info(`Trying Oura API v2 endpoint: /daily_sleep`, { requestId });
-        response = await ouraClient.get('/daily_sleep', {
-          params: {
-            start_date: formattedStartDate,
-            end_date: formattedEndDate
-          }
-        });
-      } catch (v2Error) {
-        // If that fails, try the alternative API path
-        logger.info(`First endpoint failed, trying alternative: /usercollection/daily_sleep`, {
-          requestId,
-          error: v2Error.message
-        });
-        
-        response = await ouraClient.get('/usercollection/daily_sleep', {
-          params: {
-            start_date: formattedStartDate,
-            end_date: formattedEndDate
-          }
-        });
-      }
-      
-      // Log received response status
-      logger.info(`Received Oura API response with status ${response.status}`, { requestId });
-
-      // Check if Oura API response has the expected structure
-      if (!response.data || !response.data.data || !Array.isArray(response.data.data)) {
-        logger.error(`Invalid Oura API response format for user ${userId}:`, { structure: JSON.stringify(response.data) });
-        return res.status(200).json({
-          message: 'Could not process Oura data: Invalid response format',
-          error: 'Invalid API response format',
-          data: []
-        });
-      }
-
-      // Log detailed response data for debugging
-      logger.info(`Received ${response.data.data.length} sleep records from Oura API for user ${userId}`);
-      
-      // Log the first record's structure (if available) to help with mapping
-      if (response.data.data.length > 0) {
-        const sampleRecord = response.data.data[0];
-        console.log("=== OURA DATA SAMPLE RECORD ===");
-        console.log(JSON.stringify(sampleRecord, null, 2));
-        console.log("=== END SAMPLE RECORD ===");
-        
-        // Log specific fields that are important for mapping
-        logger.info("Oura API field map:", {
-          day: sampleRecord.day,
-          sleep_score: sampleRecord.sleep_score,
-          total_sleep_duration: sampleRecord.total_sleep_duration,
-          deep_sleep_duration: sampleRecord.deep_sleep_duration,
-          rem_sleep_duration: sampleRecord.rem_sleep_duration,
-          light_sleep_duration: sampleRecord.light_sleep_duration
-        });
-      }
-
-      // Map Oura data to our format
-      const ouraData = mapOuraDataToSleepData(response.data.data, userId);
-
-      // Log and validate the mapped data
-      logger.info(`Mapped ${ouraData.length} Oura records to sleep data format for user ${userId}`);
-      
-      // Debug: Log first record after mapping if available
-      if (ouraData.length > 0) {
-        logger.info(`First mapped record sample:`, JSON.stringify(ouraData[0], null, 2));
-      }
-      
-      if (ouraData.length === 0) {
-        logger.warn(`No valid sleep data records mapped from Oura for user ${userId}`);
-        return res.status(200).json({
-          message: 'No valid sleep data records found from Oura',
-          recordsProcessed: 0
-        });
-      }
-
-      // Process and store the data
-      // Use smaller batches to avoid potential issues with large batches
-      let processedCount = 0;
-      let errorCount = 0;
-      const BATCH_SIZE = 20; // Process in smaller batches of 20 records
-      
-      // Log how many records we're about to process
-      logger.info(`Processing ${ouraData.length} sleep records in batches for user ${userId}`);
-      
-      // First, ensure the parent document exists
-      const parentRef = firestore.collection('sleepData').doc(userId);
-      const parentDoc = await parentRef.get();
-      
-      if (!parentDoc.exists) {
-        logger.info(`Creating parent sleep data document for user ${userId}`);
-        await parentRef.set({
-          userId,
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
-          totalRecords: 0,
-          dateRange: {
-            firstDate: ouraData.length > 0 ? ouraData[0].date : new Date(),
-            lastDate: ouraData.length > 0 ? ouraData[ouraData.length - 1].date : new Date()
-          }
-        });
-        logger.info(`Parent sleep data document created for user ${userId}`);
-      }
-      
-      // Process in smaller batches
-      for (let i = 0; i < ouraData.length; i += BATCH_SIZE) {
-        const batch = firestore.batch();
-        const currentBatch = ouraData.slice(i, i + BATCH_SIZE);
-        
-        logger.info(`Processing batch ${Math.floor(i/BATCH_SIZE) + 1} with ${currentBatch.length} records for user ${userId}`);
-        
-        for (const sleepRecord of currentBatch) {
-          try {
-            // Create a sleep data model with validation
-            const sleepData = new SleepData({
-              userId,
-              dateId: sleepRecord.dateId,
-              date: sleepRecord.date,
-              ouraScore: sleepRecord.ouraScore,
-              metrics: sleepRecord.metrics,
-              tags: [],
-              notes: ''
-            });
-  
-            // Validate the sleep data
-            const validation = sleepData.validate();
-            if (!validation.valid) {
-              logger.warn(`Invalid sleep data record for user ${userId}, date ${sleepRecord.dateId}:`, 
-                { errors: validation.errors });
-              errorCount++;
-              continue;
-            }
-  
-            // Get existing data to preserve any notes and tags
-            const existingData = await firestoreUtils.getSleepData(userId, sleepRecord.dateId);
-            if (existingData) {
-              sleepData.tags = existingData.tags || [];
-              sleepData.notes = existingData.notes || '';
-              logger.info(`Preserving existing tags/notes for date ${sleepRecord.dateId}`);
-            }
-  
-            // Add the sleep data document to batch
-            const docRef = firestore
-              .collection('sleepData')
-              .doc(userId)
-              .collection('daily')
-              .doc(sleepRecord.dateId);
-  
-            // Debug log the sleep data object before saving
-            logger.info(`Saving sleep data for date ${sleepRecord.dateId}, score: ${sleepData.ouraScore}`);
-            
-            batch.set(docRef, sleepData.toFirestore(), { merge: true });
-            
-            // Also update the parent document metadata
-            batch.update(parentRef, {
-              totalRecords: admin.firestore.FieldValue.increment(1),
-              lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
-              'dateRange.lastDate': sleepRecord.date
-            });
-            processedCount++;
-          } catch (recordError) {
-            logger.error(`Error processing sleep record for date ${sleepRecord?.dateId}:`, recordError);
-            errorCount++;
-          }
-        }
-  
-        // Commit the current batch
-        try {
-          await batch.commit();
-          logger.info(`Successfully committed batch ${Math.floor(i/BATCH_SIZE) + 1} for user ${userId}, processed: ${currentBatch.length} records`);
-        } catch (batchError) {
-          logger.error(`Error committing batch ${Math.floor(i/BATCH_SIZE) + 1} for user ${userId}:`, batchError);
-          // Do not stop processing on batch error, continue with next batch
-          errorCount += currentBatch.length;
-        }
-      }
-
-      // Update lastSyncDate to track when data was last synced
-      // Explicitly create a new date and convert to ISO string for consistent handling
-      const newSyncDate = new Date();
-      
-      // Make a direct update to the user document to ensure the lastSyncDate is properly stored
-      try {
-        logger.info(`Updating user ${userId} with new lastSyncDate: ${newSyncDate.toISOString()}`);
-        
-        // Modify the user object for the upcoming save
-        user.ouraIntegration.lastSyncDate = newSyncDate;
-        
-        // First try using the Firestore API directly for the update
-        const firestore = admin.firestore();
-        await firestore.collection('users').doc(userId).update({
-          'ouraIntegration.lastSyncDate': newSyncDate,
-          'updatedAt': admin.firestore.FieldValue.serverTimestamp()
-        });
-        
-        logger.info(`Successfully updated lastSyncDate directly for user ${userId}`);
-      } catch (directUpdateError) {
-        logger.error(`Failed to update lastSyncDate directly for user ${userId}:`, directUpdateError);
-        
-        // Fallback to using the firestoreUtils helper
-        try {
-          await firestoreUtils.saveUser(user);
-          logger.info(`Successfully updated lastSyncDate via firestoreUtils for user ${userId}`);
-        } catch (userUpdateError) {
-          logger.error(`Failed to update lastSyncDate via helper for user ${userId}:`, userUpdateError);
-          // Continue processing - this shouldn't fail the overall sync
-        }
-      }
-
-      // Update sleep summaries
-      await updateSleepSummaries(userId);
-
-      return res.status(200).json({
-        message: 'Sleep data synchronized successfully',
-        recordsProcessed: processedCount,
-        recordsInvalid: errorCount,
-        recordsTotal: ouraData.length
-      });
-    } catch (apiError) {
-      // Enhanced error logging with more details
-      logger.error('Error fetching data from Oura API:', {
-        error: apiError.message,
-        stack: apiError.stack,
-        code: apiError.code,
-        requestId
-      });
-      
-      // Log the response data if available
-      if (apiError.response) {
-        logger.error('Oura API error response:', {
-          status: apiError.response.status,
-          statusText: apiError.response.statusText,
-          data: JSON.stringify(apiError.response.data).substring(0, 500),
-          requestId
-        });
-        
-        // Specific handling for 401 errors (unauthorized)
-        if (apiError.response.status === 401) {
-          logger.error('Oura API authentication error - token may be invalid', { requestId });
-          // Attempt to mark token as invalid to force re-authentication
-          try {
-            user.ouraIntegration.tokenInvalid = true;
-            await firestoreUtils.saveUser(user);
-            logger.info(`Marked Oura token as invalid for user ${userId}`);
-          } catch (tokenUpdateError) {
-            logger.error(`Failed to mark token as invalid: ${tokenUpdateError.message}`);
-          }
-          
-          return res.status(200).json({
-            message: 'Authentication error with Oura. Please reconnect your Oura ring.',
-            error: 'Oura authentication failed',
-            needsReconnect: true,
-            data: []
-          });
-        }
-      }
-      
-      // Return a more specific error message for debugging purposes
-      return res.status(200).json({
-        message: 'Could not fetch data from Oura API',
-        error: apiError.message || 'Error accessing Oura API',
-        errorCode: apiError.code,
-        data: []
-      });
-    }
-  } catch (error) {
-    logger.error('Error syncing sleep data:', error);
-    // Return a non-failing response with error details
-    return res.status(200).json({
-      message: 'Could not sync sleep data, but continuing anyway',
-      error: error.message || 'Unknown error occurred',
-      data: []
-    });
+/**
+ * Initializes the controller with necessary dependencies.
+ * @param {object} fsUtils - Firestore utility functions instance.
+ */
+const init = (fsUtils) => {
+  if (!fsUtils) {
+    throw new Error("Firestore utils are required for sleep controller initialization.");
   }
+  firestoreUtils = fsUtils;
+  logger.info('Sleep controller initialized successfully.');
 };
 
-// Map Oura API data format to our internal sleep data structure
-const mapOuraDataToSleepData = (ouraData, userId) => {
-  // Validate input
-  if (!ouraData || !Array.isArray(ouraData)) {
-    logger.error('Invalid ouraData provided to mapOuraDataToSleepData');
+/**
+ * Maps Oura V2 API daily_sleep data to our internal SleepData structure.
+ * @param {Array<object>} ouraApiData - Array of sleep record objects from Oura V2 API.
+ * @param {string} userId - The user ID.
+ * @returns {Array<object>} Array of mapped SleepData objects (without validation).
+ */
+const mapOuraDataToSleepData = (ouraApiData, userId) => {
+  if (!ouraApiData || !Array.isArray(ouraApiData)) {
+    logger.error('Invalid or missing ouraApiData provided to mapOuraDataToSleepData', { userId });
     return [];
   }
 
-  // Log the complete structure of the first record for debugging
-  if (ouraData.length > 0) {
-    logger.info(`Full structure of Oura record for mapping reference:`, 
-      JSON.stringify(ouraData[0], null, 2).substring(0, 1000));
-  }
-  
-  // For debugging
-  logger.info(`Processing ${ouraData.length} Oura records for mapping`);
+  logger.info(`Mapping ${ouraApiData.length} Oura records for user ${userId}`);
 
-  return ouraData.map((record, index) => {
-    // For debugging the first few records
-    if (index < 3) {
-      logger.info(`Processing record ${index + 1}/${ouraData.length}:`, JSON.stringify(record, null, 2));
-    }
-  
+  // Log the structure of the first record for reference if available
+  if (ouraApiData.length > 0) {
+    logger.debug(`Sample Oura V2 record structure for mapping reference (userId: ${userId}):`, {
+      sampleRecord: JSON.stringify(ouraApiData[0], null, 2).substring(0, 1000) // Log snippet
+    });
+  }
+
+  return ouraApiData.map((record, index) => {
     try {
-      // Validate and extract date - check both v1 and v2 API formats
-      // v2 API uses 'day', v1 might use 'summary_date' or other fields
-      const dayField = record.day || record.summary_date || record.timestamp_date;
-      
-      if (!dayField) {
-        logger.warn('Skipping Oura record with missing day field', { 
-          recordId: record.id,
-          fields: Object.keys(record).join(', ')
+      // --- Validate Essential V2 Fields ---
+      if (!record || typeof record !== 'object') {
+        logger.warn(`Skipping invalid Oura record (not an object) at index ${index}`, { userId });
+        return null;
+      }
+
+      const dayField = record.day; // V2 uses 'day' (YYYY-MM-DD)
+      if (!dayField || typeof dayField !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(dayField)) {
+        logger.warn('Skipping Oura record with missing or invalid "day" field', {
+          userId,
+          recordId: record.id || `index_${index}`,
+          dayReceived: dayField,
+          keys: Object.keys(record).join(', ')
         });
         return null;
       }
 
-      // Get date in YYYY-MM-DD format
       const dateId = dayField;
-      const date = new Date(dayField);
+      const date = moment.utc(dayField).toDate(); // Use UTC to avoid timezone issues with YYYY-MM-DD
 
       if (isNaN(date.getTime())) {
-        logger.warn(`Invalid date in Oura record: ${dayField}`, { recordId: record.id });
+        logger.warn(`Invalid date parsed from Oura record day: ${dayField}`, { userId, recordId: record.id });
         return null;
       }
-      
-      // For first record, log detailed field paths for debugging
-      if (index === 0) {
-        logger.info('Detailed field mapping for first record:', {
-          day: dayField,
-          score_paths: {
-            direct_score: record.score,
-            sleep_score: record.sleep_score,
-            score_nested: record.score_nested,
-          },
-          duration_paths: {
-            direct_duration: record.duration,
-            total_sleep_duration: record.total_sleep_duration,
-            deep_sleep_duration: record.deep_sleep_duration,
-            rem_sleep_duration: record.rem_sleep_duration,
-            light_sleep_duration: record.light_sleep_duration,
-          },
-          has_contributors: !!record.contributors
-        });
+
+      // --- Extract V2 Fields ---
+      const sleepScore = record.score; // V2 uses 'score'
+      if (typeof sleepScore !== 'number') {
+         logger.warn(`Skipping Oura record with missing or invalid "score" field`, {
+           userId,
+           recordId: record.id,
+           dateId,
+           scoreReceived: sleepScore
+         });
+         // Decide if you want to skip or provide a default. Skipping is safer.
+         // return null;
+         // Or provide a default if a record without a score is still useful:
+         // sleepScore = 0; // Or some other default indicator
+         return null; // Skipping for now
       }
 
-      // Handle different API versions - try all possible field paths
-      // 1. Direct fields - for v1 API
-      // 2. Nested contributors - for v2 API
-      
-      // Determine sleep score - try multiple possible field paths
-      let sleepScore = 0;
-      if (typeof record.score === 'number') {
-        // v2 API format
-        sleepScore = record.score;
-      } else if (typeof record.sleep_score === 'number') {
-        // v1 API format
-        sleepScore = record.sleep_score;
-      } else if (record.score_nested && typeof record.score_nested.total === 'number') {
-        // Another possible format
-        sleepScore = record.score_nested.total;
-      } else {
-        // Default fallback - estimate from contributors if available
-        const contributors = record.contributors || {};
-        if (contributors.total_sleep && contributors.deep_sleep && contributors.efficiency) {
-          // Weighted average of key contributors
-          sleepScore = Math.round(
-            (contributors.total_sleep * 0.4) + 
-            (contributors.deep_sleep * 0.3) + 
-            (contributors.efficiency * 0.3)
-          );
-        } else {
-          // Use a default score
-          sleepScore = 70;
-          logger.warn(`Using default sleep score for record ${record.id}`);
-        }
-      }
-      
-      // Determine sleep durations - try both direct fields and contributors
-      let totalSleepSeconds, deepSleepSeconds, remSleepSeconds, lightSleepSeconds, latencySeconds;
-      
-      // First try direct duration fields (v1 API format)
-      if (typeof record.total_sleep_duration === 'number') {
-        // Use actual durations if available
-        totalSleepSeconds = record.total_sleep_duration;
-        deepSleepSeconds = record.deep_sleep_duration || 0;
-        remSleepSeconds = record.rem_sleep_duration || 0;
-        lightSleepSeconds = record.light_sleep_duration || 0;
-        latencySeconds = record.onset_latency || 0;
-        
-        logger.info(`Using direct duration fields for record ${record.id || index}`);
-      } 
-      // Then try duration fields inside nested objects
-      else if (record.duration && typeof record.duration.total_sleep === 'number') {
-        totalSleepSeconds = record.duration.total_sleep;
-        deepSleepSeconds = record.duration.deep_sleep || 0;
-        remSleepSeconds = record.duration.rem_sleep || 0;
-        lightSleepSeconds = record.duration.light_sleep || 0;
-        latencySeconds = record.latency || 0;
-        
-        logger.info(`Using nested duration fields for record ${record.id || index}`);
-      }
-      // Finally fall back to estimating from contributors percentages
-      else {
-        // Extract metrics from the contributors object if available
-        const contributors = record.contributors || {};
-        
-        // Calculate approximate sleep durations from the score percentages
-        // These are estimates since the API doesn't provide exact durations
-        // Average adult needs about 8 hours (28800 seconds) of sleep
-        totalSleepSeconds = 28800 * (contributors.total_sleep || 90) / 100;
-        
-        // Proportional estimates based on typical sleep stage percentages
-        // Deep sleep: ~15-25% of total sleep
-        deepSleepSeconds = totalSleepSeconds * 0.20 * (contributors.deep_sleep || 90) / 100;
-        
-        // REM sleep: ~20-25% of total sleep
-        remSleepSeconds = totalSleepSeconds * 0.22 * (contributors.rem_sleep || 90) / 100;
-        
-        // Light sleep: remaining sleep time
-        lightSleepSeconds = totalSleepSeconds - deepSleepSeconds - remSleepSeconds;
-        
-        // Latency estimate based on score (lower score = longer latency, up to 30 minutes)
-        latencySeconds = 1800 * (1 - (contributors.latency || 80) / 100);
-        
-        logger.info(`Using estimated durations from contributors for record ${record.id || index}`);
-      }
-      
-      // Get heart rate data if available
-      const hrAvg = record.hr_average || (record.heart_rate && record.heart_rate.average) || 0;
-      const hrLowest = record.hr_lowest || (record.heart_rate && record.heart_rate.lowest) || 0;
-      
-      // Get HRV if available
-      const hrv = record.rmssd || (record.hrv && record.hrv.rmssd) || 0;
-      
-      // Get respiratory rate if available
-      const respRate = record.breath_average || (record.respiratory_rate && record.respiratory_rate.average) || 0;
 
-      // Create the mapped sleep data object
+      // Durations are typically in seconds in V2
+      const totalSleepSeconds = record.total_sleep_duration ?? 0; // Use nullish coalescing for defaults
+      const deepSleepSeconds = record.deep_sleep_duration ?? 0;
+      const remSleepSeconds = record.rem_sleep_duration ?? 0;
+      const lightSleepSeconds = record.light_sleep_duration ?? 0;
+      const latencySeconds = record.onset_latency ?? 0;
+      const efficiency = record.efficiency ?? 0; // Efficiency score (0-100)
+
+      // Heart rate data
+      const hrAvg = record.hr_average ?? 0;
+      const hrLowest = record.hr_lowest ?? 0;
+
+      // HRV data (Root Mean Square of Successive Differences)
+      const hrv = record.rmssd ?? 0;
+
+      // Respiratory rate data
+      const respRate = record.breath_average ?? 0;
+
+      // --- Create Mapped Object ---
       const mappedData = {
         userId,
-        dateId,
-        date,
-        ouraScore: Math.round(sleepScore), // Ensure it's a whole number
+        dateId, // YYYY-MM-DD
+        date,   // JavaScript Date object (UTC)
+        ouraScore: Math.round(sleepScore), // Ensure integer score
         metrics: {
           totalSleepTime: Math.round(totalSleepSeconds),
-          efficiency: (record.efficiency || (record.contributors && record.contributors.efficiency) || 0) * 100,
+          efficiency: Math.round(efficiency), // Ensure integer efficiency
           deepSleep: Math.round(deepSleepSeconds),
           remSleep: Math.round(remSleepSeconds),
           lightSleep: Math.round(lightSleepSeconds),
@@ -626,406 +134,966 @@ const mapOuraDataToSleepData = (ouraData, userId) => {
             average: hrAvg,
             lowest: hrLowest
           },
-          hrv: hrv,
-          respiratoryRate: respRate
+          hrv: hrv, // Usually ms or ms^2 depending on specific 'rmssd' field variant
+          respiratoryRate: respRate // Breaths per minute
         },
         sourceData: {
           provider: 'oura',
-          providerUserId: record.user_id || 'unknown',
-          sourceType: 'oura_sleep',
-          sourceId: record.id || `generated-${Date.now()}`
+          // providerUserId: record.user_id || 'unknown', // V2 API doesn't usually return user_id per record
+          sourceType: 'oura_sleep_v2', // Be specific about the source
+          sourceId: record.id || `generated-${dateId}-${Date.now()}` // Use Oura record ID if available
         }
       };
-      
-      // Log the first couple of mapped records for debugging
+
+      // Log first couple of mapped records for debugging if needed
       if (index < 2) {
-        logger.info(`Mapped record ${index + 1}:`, JSON.stringify(mappedData, null, 2));
+        logger.debug(`Mapped Oura record ${index + 1} for user ${userId}:`, { mappedData });
       }
-      
+
       return mappedData;
+
     } catch (error) {
-      logger.error(`Error mapping Oura record:`, { 
-        error: error.message, 
-        stack: error.stack,
-        recordIndex: index,
-        record: JSON.stringify(record)
+      logger.error(`Error mapping Oura record at index ${index} for user ${userId}:`, {
+        error: error.message,
+        stack: error.stack?.substring(0, 300), // Log part of stack
+        recordId: record?.id,
+        recordKeys: record ? Object.keys(record).join(', ') : 'N/A'
+        // Avoid logging the full record PII if possible, log keys or ID instead
       });
       return null;
     }
-  }).filter(Boolean); // Remove any null entries
+  }).filter(Boolean); // Remove any null entries from mapping errors or skipped records
 };
 
-// Get sleep data for a specific date
-const getSleepData = async (req, res) => {
-  try {
-    const userId = req.userId;
-    const { date } = req.params; // Format: YYYY-MM-DD
 
-    if (!date || !date.match(/^\d{4}-\d{2}-\d{2}$/)) {
-      return res.status(400).json({ error: 'Invalid date format. Please use YYYY-MM-DD' });
+/**
+ * Syncs sleep data from the Oura V2 API for the authenticated user.
+ * Handles token refresh, fetches data, maps it, and stores it in Firestore.
+ * @param {object} req - Express request object (requires `req.userId`).
+ * @param {object} res - Express response object.
+ * @returns {Promise<object>} Express response.
+ */
+const syncOuraData = async (req, res) => {
+  const firestore = admin.firestore();
+  const userId = req.userId; // Assumes userId is attached by auth middleware
+  const requestId = uuidv4(); // Unique ID for tracing this sync operation
+
+  if (!userId) {
+    logger.error('Missing userId in syncOuraData request', { requestId });
+    // Avoid 500 for auth issues potentially caught later, but log severity
+    return res.status(401).json({ message: "Authentication required.", error: "User ID missing." });
+  }
+
+  logger.info(`Starting Oura data sync for user ID: ${userId}`, { requestId });
+
+  try {
+    // 1. Get User and Oura Integration Details
+    const user = await firestoreUtils.getUser(userId);
+
+    if (!user) {
+      logger.error(`User not found during Oura sync: ${userId}`, { requestId });
+      return res.status(404).json({ message: 'User not found', error: 'User record does not exist.' });
+    }
+    user.id = userId; // Ensure ID is consistently set
+
+    // Ensure ouraIntegration exists and is initialized
+    if (!user.ouraIntegration) {
+      logger.warn(`User ${userId} has no ouraIntegration object. Initializing.`, { requestId });
+      user.ouraIntegration = { connected: false, tokenInvalid: false };
+      // Persist this initialization? Maybe not here, but upon connection.
     }
 
+    logger.info(`Checking Oura connection status for user ${userId}: connected=${user.ouraIntegration.connected}, tokenInvalid=${user.ouraIntegration.tokenInvalid}`, { requestId });
+
+    // 2. Check Connection Status and Tokens
+    if (
+      !user.ouraIntegration.connected ||
+      user.ouraIntegration.tokenInvalid || // Check if token was marked invalid previously
+      !user.ouraIntegration.accessToken ||
+      !user.ouraIntegration.refreshToken
+    ) {
+      const message = user.ouraIntegration.tokenInvalid
+        ? 'Oura authorization needs renewal. Please reconnect your Oura ring.'
+        : 'No Oura Ring connected or authorized.';
+      logger.info(`Sync skipped for user ${userId}: ${message}`, { requestId });
+      return res.status(200).json({
+        message: message,
+        data: [],
+        needsReconnect: user.ouraIntegration.tokenInvalid || !user.ouraIntegration.connected, // Flag for client UI
+        noConnection: !user.ouraIntegration.connected // Specific flag for no connection initially
+      });
+    }
+
+    // 3. Check Token Expiration and Refresh if Needed
+    let accessToken = user.ouraIntegration.accessToken; // Encrypted token
+    const now = new Date();
+    const expiryTime = user.ouraIntegration.expiresAt ? new Date(user.ouraIntegration.expiresAt) : null; // Handle potentially stored string/timestamp
+    const isExpired = !expiryTime || now >= expiryTime;
+
+    if (isExpired) {
+      logger.info(`Oura token expired or nearing expiration for user ${userId}. Refreshing...`, {
+        requestId,
+        expiryTime: expiryTime?.toISOString(),
+        now: now.toISOString()
+      });
+      try {
+        const tokenResponse = await ouraOAuth.refreshAccessToken(user.ouraIntegration.refreshToken); // Assumes refreshToken is stored encrypted and handled by the utility
+
+        // Encrypt new tokens before storing
+        accessToken = ouraOAuth.encryptData(tokenResponse.access_token);
+        const newEncryptedRefreshToken = ouraOAuth.encryptData(tokenResponse.refresh_token);
+
+        // Calculate new expiration time (subtract safety margin, e.g., 5-10 mins)
+        const expiresInSeconds = tokenResponse.expires_in;
+        const safetyMarginSeconds = 600; // 10 minutes
+        const newExpiryTime = new Date(now.getTime() + (expiresInSeconds - safetyMarginSeconds) * 1000);
+
+        logger.info(`Oura token refreshed successfully for user ${userId}. New expiry: ${newExpiryTime.toISOString()}`, { requestId });
+
+        // Update user record with new tokens and expiry
+        user.ouraIntegration.accessToken = accessToken;
+        user.ouraIntegration.refreshToken = newEncryptedRefreshToken;
+        user.ouraIntegration.expiresAt = newExpiryTime;
+        user.ouraIntegration.lastRefreshed = now;
+        user.ouraIntegration.tokenInvalid = false; // Explicitly mark as valid after successful refresh
+
+        await firestoreUtils.saveUser(user); // Assumes saveUser handles updates correctly
+        logger.info(`Saved updated Oura tokens for user ${userId}`, { requestId });
+
+      } catch (tokenError) {
+        logger.error(`Failed to refresh Oura token for user ${userId}. Marking connection as invalid.`, {
+          requestId,
+          error: tokenError.message,
+          // Include stack only in debug/verbose mode if needed
+          // stack: tokenError.stack
+        });
+
+        // Mark token as invalid to prevent further API calls until re-auth
+        user.ouraIntegration.tokenInvalid = true;
+        try {
+          await firestoreUtils.saveUser(user);
+          logger.info(`Marked Oura connection as invalid for user ${userId} due to refresh failure.`, { requestId });
+        } catch (updateError) {
+          logger.error(`Failed to mark Oura token as invalid for user ${userId} after refresh failure:`, {
+            requestId,
+            updateError: updateError.message
+          });
+        }
+
+        // Return a clear message to the client
+        return res.status(200).json({ // Use 200 because sync *attempt* finished, but needs action
+          message: 'Oura authorization needs renewal. Please reconnect your Oura ring.',
+          data: [],
+          error: 'Failed to refresh Oura token.',
+          needsReconnect: true // Flag for client UI
+        });
+      }
+    } else {
+        // Log time to expiry if not expired
+        const timeToExpiryMinutes = expiryTime ? Math.round((expiryTime.getTime() - now.getTime()) / 1000 / 60) : 'unknown';
+        logger.info(`Oura token for user ${userId} is valid. Expires in approx ${timeToExpiryMinutes} minutes.`, { requestId });
+    }
+
+
+    // 4. Determine Sync Period
+    const endDate = moment.utc().endOf('day'); // Sync up to end of today (UTC)
+    let startDate;
+    const sixMonthsAgo = moment.utc().subtract(6, 'months').startOf('day');
+    const lastSyncDateRaw = user.ouraIntegration.lastSyncDate;
+    let lastSyncDate = null;
+
+    if (lastSyncDateRaw) {
+        // Handle Firestore Timestamp or ISO string
+        if (lastSyncDateRaw.toDate) { // Firestore Timestamp
+            lastSyncDate = moment.utc(lastSyncDateRaw.toDate());
+        } else if (typeof lastSyncDateRaw === 'string') {
+            lastSyncDate = moment.utc(lastSyncDateRaw);
+        } else if (lastSyncDateRaw instanceof Date) {
+            lastSyncDate = moment.utc(lastSyncDateRaw);
+        }
+    }
+
+    if (lastSyncDate && lastSyncDate.isValid() && lastSyncDate.isAfter(sixMonthsAgo)) {
+      // Sync from the day *after* the last sync to avoid duplicates, up to max 6 months back
+      startDate = lastSyncDate.add(1, 'day').startOf('day');
+      logger.info(`Incremental sync for user ${userId}. Fetching data from ${startDate.format('YYYY-MM-DD')} to ${endDate.format('YYYY-MM-DD')}.`, { requestId });
+    } else {
+      // First sync or last sync too long ago, fetch last 6 months
+      startDate = sixMonthsAgo;
+       logger.info(`Performing full sync (or >6 months since last) for user ${userId}. Fetching data from ${startDate.format('YYYY-MM-DD')} to ${endDate.format('YYYY-MM-DD')}.`, { requestId });
+    }
+
+    // Ensure start date is not after end date
+    if (startDate.isAfter(endDate)) {
+        logger.info(`Start date ${startDate.format('YYYY-MM-DD')} is after end date ${endDate.format('YYYY-MM-DD')}. No new data to fetch for user ${userId}.`, { requestId });
+        // Optionally update lastSyncDate here even if no data fetched?
+        // user.ouraIntegration.lastSyncDate = new Date(); // Update sync time regardless
+        // await firestoreUtils.saveUser(user);
+        return res.status(200).json({
+            message: 'Sleep data is already up to date.',
+            recordsProcessed: 0,
+            recordsTotal: 0
+        });
+    }
+
+    // Format dates for API (YYYY-MM-DD)
+    const formattedStartDate = startDate.format('YYYY-MM-DD');
+    const formattedEndDate = endDate.format('YYYY-MM-DD');
+
+    // 5. Fetch Data from Oura API V2
+    let apiResponseData = [];
+    try {
+      // Create Oura client (assumes it handles decryption internally or token is decrypted)
+      const ouraClient = ouraOAuth.createOuraClient(accessToken, requestId); // Pass request ID for potential tracing in client
+
+      logger.info(`Making Oura API V2 request to /daily_sleep for user ${userId}`, {
+        requestId,
+        params: { start_date: formattedStartDate, end_date: formattedEndDate }
+      });
+
+      // Use the documented V2 endpoint
+      const response = await ouraClient.get('/daily_sleep', {
+        params: {
+          start_date: formattedStartDate,
+          end_date: formattedEndDate
+        }
+      });
+
+      logger.info(`Received Oura API response status ${response.status} for user ${userId}`, { requestId });
+
+      // Basic validation of the V2 response structure
+      if (!response.data || !Array.isArray(response.data.data)) {
+        logger.error(`Invalid Oura API response format received for user ${userId}. Expected { data: [...] }`, {
+            requestId,
+            responseStructure: JSON.stringify(response.data)?.substring(0, 500) // Log snippet
+        });
+        // Don't throw, return controlled error response
+         return res.status(200).json({
+            message: 'Received an unexpected response format from Oura. Sync could not be completed.',
+            error: 'Invalid API response format',
+            data: []
+        });
+      }
+
+      apiResponseData = response.data.data;
+      logger.info(`Received ${apiResponseData.length} sleep records from Oura API for user ${userId}`, { requestId });
+
+    } catch (apiError) {
+      let errorMessage = 'Failed to fetch data from Oura API.';
+      let needsReconnect = false;
+      let statusCode = 500; // Default internal error
+
+      if (apiError.response) {
+        // Handle specific HTTP errors from Oura
+        statusCode = apiError.response.status;
+        const responseDataSnippet = JSON.stringify(apiError.response.data)?.substring(0, 500);
+        logger.error(`Oura API request failed for user ${userId} with status ${statusCode}`, {
+          requestId,
+          statusText: apiError.response.statusText,
+          data: responseDataSnippet,
+          // config: apiError.config // Can be verbose, enable if needed
+        });
+
+        if (statusCode === 401 || statusCode === 403) {
+          errorMessage = 'Oura authorization failed. Please reconnect your Oura ring.';
+          needsReconnect = true;
+          // Mark token as invalid
+          user.ouraIntegration.tokenInvalid = true;
+          try {
+            await firestoreUtils.saveUser(user);
+            logger.info(`Marked Oura connection as invalid for user ${userId} due to ${statusCode} error.`, { requestId });
+          } catch (updateError) {
+            logger.error(`Failed to mark Oura token as invalid for user ${userId} after ${statusCode} error:`, {
+              requestId,
+              updateError: updateError.message
+            });
+          }
+        } else if (statusCode === 429) {
+          errorMessage = 'Oura API rate limit exceeded. Please try again later.';
+          // Optionally implement backoff strategy here or rely on client retry
+        } else {
+           errorMessage = `Oura API returned an error (Status: ${statusCode}).`;
+        }
+      } else {
+        // Network error or other issue before getting a response
+        logger.error(`Error connecting to Oura API for user ${userId}:`, {
+          requestId,
+          error: apiError.message,
+          code: apiError.code // e.g., ECONNREFUSED
+        });
+         errorMessage = 'Could not connect to Oura API.';
+      }
+
+      // Return controlled response
+      return res.status(200).json({ // 200 as sync attempt finished, action might be needed
+        message: errorMessage,
+        error: apiError.message || 'Unknown Oura API error',
+        errorCode: apiError.code,
+        statusCode: statusCode, // Include Oura status code if available
+        needsReconnect: needsReconnect,
+        data: []
+      });
+    }
+
+    // 6. Map Oura Data
+    const mappedSleepData = mapOuraDataToSleepData(apiResponseData, userId);
+    logger.info(`Mapped ${mappedSleepData.length} Oura records to internal format for user ${userId}`, { requestId });
+
+    if (mappedSleepData.length === 0 && apiResponseData.length > 0) {
+      logger.warn(`No valid sleep records could be mapped from ${apiResponseData.length} received Oura records for user ${userId}. Check mapping logic and data quality.`, { requestId });
+       // Potentially return info about skipped records if needed by client
+    }
+     if (mappedSleepData.length === 0) {
+      logger.info(`No new sleep data to process after mapping for user ${userId}`, { requestId });
+       // Update last sync date even if no new records were processed? Yes, sync *attempted*.
+        user.ouraIntegration.lastSyncDate = new Date();
+        await firestoreUtils.saveUser(user);
+        logger.info(`Updated lastSyncDate for user ${userId} after sync attempt yielded no processable data.`, { requestId });
+
+       return res.status(200).json({
+          message: 'No new sleep data found or processed from Oura.',
+          recordsProcessed: 0,
+          recordsTotal: apiResponseData.length // Show how many raw records were received
+        });
+    }
+
+
+    // 7. Process and Store Data in Batches
+    let processedCount = 0;
+    let errorCount = 0;
+    const BATCH_SIZE = 50; // Firestore batch limit is 500, use smaller for safety/memory
+    const parentRef = firestore.collection('sleepData').doc(userId);
+    const dailyCollectionRef = parentRef.collection('daily');
+
+    logger.info(`Processing ${mappedSleepData.length} mapped sleep records in batches of ${BATCH_SIZE} for user ${userId}`, { requestId });
+
+    // Ensure parent document exists (optional, set with merge handles it, but explicit can be clearer)
+    try {
+        await parentRef.set({ userId: userId, lastUpdated: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+        logger.debug(`Ensured parent sleep data document exists for user ${userId}`, { requestId });
+    } catch (parentDocError) {
+        logger.error(`Failed to ensure parent sleep data document for user ${userId}`, { requestId, error: parentDocError.message });
+        // Decide if this is critical - probably yes, halt processing.
+        return res.status(500).json({ message: "Failed to prepare user data storage.", error: parentDocError.message });
+    }
+
+    // Sort data by date to ensure dateRange updates correctly
+    mappedSleepData.sort((a, b) => a.date.getTime() - b.date.getTime());
+    const firstDate = mappedSleepData[0].date;
+    const lastDate = mappedSleepData[mappedSleepData.length - 1].date;
+
+
+    for (let i = 0; i < mappedSleepData.length; i += BATCH_SIZE) {
+      const batch = firestore.batch();
+      const currentBatchItems = mappedSleepData.slice(i, i + BATCH_SIZE);
+      const batchNumber = Math.floor(i / BATCH_SIZE) + 1;
+
+      logger.info(`Processing batch ${batchNumber} with ${currentBatchItems.length} records for user ${userId}`, { requestId });
+
+      for (const sleepRecord of currentBatchItems) {
+        try {
+          // Create SleepData instance (includes built-in validation if model has it)
+          const sleepData = new SleepData({
+            ...sleepRecord, // Spread the mapped data
+            tags: [],       // Initialize empty, preserve below if exists
+            notes: ''       // Initialize empty, preserve below if exists
+          });
+
+          // Optional: Explicit validation call if needed
+          // const validation = sleepData.validate();
+          // if (!validation.valid) {
+          //   logger.warn(`Invalid sleep data record constructed for user ${userId}, date ${sleepRecord.dateId}`,
+          //     { errors: validation.errors, requestId });
+          //   errorCount++;
+          //   continue; // Skip this record
+          // }
+
+          // Get existing data to preserve user-added notes/tags
+          const docRef = dailyCollectionRef.doc(sleepRecord.dateId);
+          const existingDoc = await docRef.get(); // Read before write to preserve
+          if (existingDoc.exists) {
+            const existingData = existingDoc.data();
+            sleepData.tags = existingData.tags || [];
+            sleepData.notes = existingData.notes || '';
+            logger.debug(`Preserving existing tags/notes for date ${sleepRecord.dateId}, user ${userId}`, { requestId });
+          }
+
+          // Add the validated & potentially merged data to the batch
+          // Use toFirestore() method if your model class has one
+          batch.set(docRef, sleepData.toFirestore ? sleepData.toFirestore() : { ...sleepData }, { merge: true });
+          processedCount++;
+
+        } catch (recordError) {
+          logger.error(`Error processing individual sleep record for date ${sleepRecord?.dateId}, user ${userId}:`, {
+             requestId,
+             recordId: sleepRecord?.sourceData?.sourceId,
+             error: recordError.message,
+             stack: recordError.stack?.substring(0, 200)
+          });
+          errorCount++;
+        }
+      } // End of batch item loop
+
+      // Commit the current batch
+      try {
+        await batch.commit();
+        logger.info(`Successfully committed batch ${batchNumber} for user ${userId} (${currentBatchItems.length} records attempt).`, { requestId });
+      } catch (batchError) {
+        logger.error(`Error committing Firestore batch ${batchNumber} for user ${userId}:`, {
+          requestId,
+          error: batchError.message,
+          // stack: batchError.stack // Potentially verbose
+        });
+        // Increment error count for all items in the failed batch
+        errorCount += currentBatchItems.length;
+        processedCount -= currentBatchItems.length; // Decrement processed count as batch failed
+        // Consider stopping sync or implementing retry for failed batch
+      }
+    } // End of batch loop
+
+
+     // 8. Update Metadata (Total Records, Date Range, Last Sync) - Outside Batch Loop for efficiency
+     try {
+        const finalUpdateData = {
+            lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+            // Only update totalRecords if you are sure about overwrite vs increment logic
+            // Consider reading the parent doc once before loop, summing, then writing once after.
+            // For simplicity, could update lastUpdated and dateRange here, totalRecords might need more robust handling
+            'dateRange.lastDate': lastDate // Update last date seen in this sync
+            // Optionally update firstDate if this is the very first sync
+            // 'dateRange.firstDate': firstDate // Careful: only set if parent doc didn't exist or had no range
+        };
+        // If you track total records, update it carefully. Incrementing assumes no overlaps.
+        // A safer approach might be to count documents after sync or use a transaction.
+        // Example increment (use with caution if syncs can overlap or process old data):
+        // if (processedCount > 0) {
+        //     finalUpdateData.totalRecords = admin.firestore.FieldValue.increment(processedCount);
+        // }
+        await parentRef.update(finalUpdateData);
+        logger.info(`Updated parent document metadata for user ${userId}`, { requestId, lastDate: lastDate.toISOString() });
+
+        // Update lastSyncDate on the user object *after* successful processing
+        const newSyncTimestamp = new Date();
+        user.ouraIntegration.lastSyncDate = newSyncTimestamp;
+        user.ouraIntegration.tokenInvalid = false; // Ensure marked as valid after successful sync
+        await firestoreUtils.saveUser(user); // Save the updated user state
+        logger.info(`Successfully updated lastSyncDate to ${newSyncTimestamp.toISOString()} for user ${userId}`, { requestId });
+
+     } catch (metaUpdateError) {
+         logger.error(`Failed to update metadata or lastSyncDate after processing for user ${userId}`, { requestId, error: metaUpdateError.message });
+         // Sync partially succeeded, but metadata is stale. Critical? Maybe just log.
+     }
+
+
+    // 9. Update Sleep Summaries (Run asynchronously, don't block response)
+    updateSleepSummaries(userId).then(() => {
+      logger.info(`Sleep summary update triggered successfully for user ${userId}`, { requestId });
+    }).catch(summaryError => {
+      logger.error(`Error triggering sleep summary update for user ${userId}:`, { requestId, error: summaryError.message });
+    });
+
+    // 10. Return Success Response
+    return res.status(200).json({
+      message: 'Sleep data synchronized successfully.',
+      recordsProcessed: processedCount,
+      recordsReceivedFromOura: apiResponseData.length,
+      recordsFailedToProcess: errorCount,
+      dateRangeSynced: { start: formattedStartDate, end: formattedEndDate }
+    });
+
+  } catch (error) {
+    // Catch-all for unexpected errors during the sync flow
+    logger.error(`Unhandled error during Oura sync for user ${userId}:`, {
+      requestId,
+      error: error.message,
+      stack: error.stack // Include stack for unexpected errors
+    });
+    // Return a generic server error response
+    return res.status(500).json({
+      message: 'An unexpected error occurred during sleep data synchronization.',
+      error: error.message || 'Internal Server Error'
+      // Avoid sending stack trace to client
+    });
+  }
+};
+
+// --- Other Endpoint Functions (with added validation and improved error handling) ---
+
+/**
+ * Get sleep data for a specific date.
+ * @param {object} req - Express request object (requires `req.userId`, `req.params.date`).
+ * @param {object} res - Express response object.
+ * @returns {Promise<object>} Express response.
+ */
+const getSleepData = async (req, res) => {
+  const userId = req.userId;
+  const { date } = req.params; // Expects YYYY-MM-DD
+
+  // Validation
+  if (!userId) {
+    return res.status(401).json({ error: 'User authentication required.' });
+  }
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    logger.warn(`Invalid date format requested in getSleepData for user ${userId}: ${date}`);
+    return res.status(400).json({ error: 'Invalid date format. Please use YYYY-MM-DD.' });
+  }
+
+  try {
     const sleepData = await firestoreUtils.getSleepData(userId, date);
 
     if (!sleepData) {
-      return res.status(404).json({ error: 'Sleep data not found for this date' });
+      logger.info(`Sleep data not found for user ${userId}, date ${date}`);
+      return res.status(404).json({ message: 'Sleep data not found for this date.', sleepData: null });
     }
 
+    logger.debug(`Retrieved sleep data for user ${userId}, date ${date}`);
     return res.status(200).json({ sleepData });
+
   } catch (error) {
-    console.error('Error getting sleep data:', error);
-    return res.status(500).json({ error: 'Failed to retrieve sleep data' });
+    logger.error(`Error getting sleep data for user ${userId}, date ${date}:`, { error: error.message, stack: error.stack });
+    return res.status(500).json({ error: 'Failed to retrieve sleep data.' });
   }
 };
 
-// Get sleep data for a date range
+/**
+ * Get sleep data for a date range.
+ * @param {object} req - Express request object (requires `req.userId`, optional `req.query.startDate`, `req.query.endDate`, `req.query.days`).
+ * @param {object} res - Express response object.
+ * @returns {Promise<object>} Express response.
+ */
 const getSleepDataRange = async (req, res) => {
+  const userId = req.userId;
+  const { startDate: queryStartDate, endDate: queryEndDate, days } = req.query;
+
+  // Validation
+  if (!userId) {
+    return res.status(401).json({ error: 'User authentication required.' });
+  }
+
+  let startMoment, endMoment;
+
   try {
-    const userId = req.userId;
-    const { startDate, endDate, days } = req.query;
-
-    let start, end;
-
-    // Handle 'days' parameter (number of past days)
+    // Determine date range
     if (days !== undefined) {
-      const daysNum = parseInt(days);
-      // Validation should already have happened in middleware
-      // Calculate start and end dates based on 'days' parameter
-      end = moment().endOf('day');
-      start = moment().subtract(daysNum, 'days').startOf('day');
-    } 
-    // Handle explicit start/end dates
-    else if (startDate && endDate) {
-      start = moment(startDate);
-      end = moment(endDate);
-      // Validation should already have happened in middleware
-    } 
-    // Default to last 7 days if no parameters are provided
-    else {
-      end = moment().endOf('day');
-      start = moment().subtract(7, 'days').startOf('day');
-      console.log('No date parameters provided, defaulting to last 7 days');
+      const daysNum = parseInt(days, 10);
+      if (isNaN(daysNum) || daysNum <= 0) {
+        return res.status(400).json({ error: 'Invalid "days" parameter. Must be a positive number.' });
+      }
+      // Inclusive of today back N days (e.g., days=7 means today + 6 previous days)
+      endMoment = moment.utc().endOf('day');
+      startMoment = moment.utc().subtract(daysNum - 1, 'days').startOf('day');
+      logger.debug(`getSleepDataRange: Using last ${daysNum} days for user ${userId}`);
+    } else if (queryStartDate && queryEndDate) {
+      startMoment = moment.utc(queryStartDate, 'YYYY-MM-DD', true); // Strict parsing
+      endMoment = moment.utc(queryEndDate, 'YYYY-MM-DD', true);
+      if (!startMoment.isValid() || !endMoment.isValid()) {
+        return res.status(400).json({ error: 'Invalid startDate or endDate format. Use YYYY-MM-DD.' });
+      }
+      if (startMoment.isAfter(endMoment)) {
+        return res.status(400).json({ error: 'startDate cannot be after endDate.' });
+      }
+      // Adjust to cover full days
+      startMoment.startOf('day');
+      endMoment.endOf('day');
+      logger.debug(`getSleepDataRange: Using date range ${startMoment.format('YYYY-MM-DD')} to ${endMoment.format('YYYY-MM-DD')} for user ${userId}`);
+    } else {
+      // Default to last 7 days (inclusive)
+      endMoment = moment.utc().endOf('day');
+      startMoment = moment.utc().subtract(6, 'days').startOf('day');
+      logger.debug(`getSleepDataRange: Defaulting to last 7 days for user ${userId}`);
     }
 
-    // Get sleep data for the date range
-    const sleepData = await firestoreUtils.getSleepDataRange(
+    // Get sleep data from Firestore
+    const sleepDataArray = await firestoreUtils.getSleepDataRange(
       userId,
-      start.toDate(),
-      end.toDate()
+      startMoment.toDate(),
+      endMoment.toDate()
     );
 
-    // Return the data, empty array if no sleep data found
-    return res.status(200).json({ 
-      sleepData: sleepData || [],
-      noData: (sleepData || []).length === 0
+    logger.info(`Retrieved ${sleepDataArray.length} sleep records for range ${startMoment.format('YYYY-MM-DD')} to ${endMoment.format('YYYY-MM-DD')} for user ${userId}`);
+
+    return res.status(200).json({
+      sleepData: sleepDataArray || [], // Ensure array is returned
+      query: { startDate: startMoment.format('YYYY-MM-DD'), endDate: endMoment.format('YYYY-MM-DD') } // Return the actual range used
+      // noData: (sleepDataArray || []).length === 0 // Client can derive this
     });
+
   } catch (error) {
-    console.error('Error getting sleep data range:', error);
-    return res.status(500).json({ error: 'Failed to retrieve sleep data range' });
+    logger.error(`Error getting sleep data range for user ${userId}:`, { error: error.message, stack: error.stack });
+    return res.status(500).json({ error: 'Failed to retrieve sleep data range.' });
   }
 };
 
-
-// Add a note to sleep data
+/**
+ * Add or update a note and/or tags for a specific sleep data entry.
+ * @param {object} req - Express request object (requires `req.userId`, `req.params.date`, `req.body.note` or `req.body.tags`).
+ * @param {object} res - Express response object.
+ * @returns {Promise<object>} Express response.
+ */
 const addSleepNote = async (req, res) => {
+  const userId = req.userId;
+  const { date } = req.params; // Expects YYYY-MM-DD
+  const { note, tags } = req.body;
+
+  // Validation
+  if (!userId) {
+    return res.status(401).json({ error: 'User authentication required.' });
+  }
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+     logger.warn(`Invalid date format provided to addSleepNote for user ${userId}: ${date}`);
+    return res.status(400).json({ error: 'Invalid date format. Please use YYYY-MM-DD.' });
+  }
+  if (note === undefined && tags === undefined) {
+     return res.status(400).json({ error: 'Please provide either "note" or "tags".' });
+  }
+  if (note !== undefined && typeof note !== 'string') {
+    return res.status(400).json({ error: '"note" must be a string.' });
+  }
+  if (tags !== undefined && (!Array.isArray(tags) || tags.some(t => typeof t !== 'string'))) {
+    return res.status(400).json({ error: '"tags" must be an array of strings.' });
+  }
+
+
   try {
-    const userId = req.userId;
-    const { date } = req.params; // Format: YYYY-MM-DD
-    const { note, tags } = req.body;
-
-    if (!date || !date.match(/^\d{4}-\d{2}-\d{2}$/)) {
-      return res.status(400).json({ error: 'Invalid date format. Please use YYYY-MM-DD' });
-    }
-
-    // Input validation
-    if (note && typeof note !== 'string') {
-      return res.status(400).json({ error: 'Note must be a string' });
-    }
-
-    if (tags && !Array.isArray(tags)) {
-      return res.status(400).json({ error: 'Tags must be an array' });
-    }
-
-    // Get sleep data for the specified date
-    let sleepData = await firestoreUtils.getSleepData(userId, date);
-
-    // If sleep data doesn't exist, create a new entry
-    if (!sleepData) {
-      sleepData = {
-        userId,
-        dateId: date,
-        date: new Date(date),
-        ouraScore: 0,
-        metrics: {},
-        tags: [],
-        notes: ''
-      };
-    }
-
-    // Update sleep data with note and tags
-    if (note !== undefined) {
-      sleepData.notes = note;
-    }
-
-    if (tags !== undefined) {
-      sleepData.tags = tags;
-    }
-
-    // Save the updated sleep data
     const firestore = admin.firestore();
-    await firestore
+    const docRef = firestore
       .collection('sleepData')
       .doc(userId)
       .collection('daily')
-      .doc(date)
-      .set(sleepData, { merge: true });
+      .doc(date);
 
+    const updateData = {};
+    if (note !== undefined) {
+      updateData.notes = note; // Overwrite existing note
+    }
+    if (tags !== undefined) {
+      updateData.tags = tags; // Overwrite existing tags
+    }
+    updateData.updatedAt = admin.firestore.FieldValue.serverTimestamp(); // Track note updates
+
+    // Use set with merge:true to create doc if it doesn't exist, or update if it does
+    await docRef.set(updateData, { merge: true });
+
+    // Optionally fetch the updated document to return it
+    const updatedDoc = await docRef.get();
+    const updatedSleepData = updatedDoc.exists ? updatedDoc.data() : null; // Should exist after set
+
+    logger.info(`Successfully updated notes/tags for user ${userId}, date ${date}`);
     return res.status(200).json({
-      message: 'Sleep note updated successfully',
-      sleepData
+      message: 'Sleep note/tags updated successfully.',
+      sleepData: updatedSleepData // Return the potentially updated/created record
     });
+
   } catch (error) {
-    console.error('Error adding sleep note:', error);
-    return res.status(500).json({ error: 'Failed to add sleep note' });
+    logger.error(`Error adding/updating sleep note for user ${userId}, date ${date}:`, { error: error.message, stack: error.stack });
+    return res.status(500).json({ error: 'Failed to update sleep note/tags.' });
   }
 };
 
-// Get sleep summary
+/**
+ * Get the calculated sleep summary for the user. Generates if missing.
+ * @param {object} req - Express request object (requires `req.userId`).
+ * @param {object} res - Express response object.
+ * @returns {Promise<object>} Express response.
+ */
 const getSleepSummary = async (req, res) => {
+  const userId = req.userId;
+
+  if (!userId) {
+    return res.status(401).json({ error: 'User authentication required.' });
+  }
+
   try {
-    const userId = req.userId;
     let summary = await firestoreUtils.getSleepSummary(userId);
 
     if (!summary) {
-      summary = await updateSleepSummaries(userId);
+      logger.info(`Sleep summary not found for user ${userId}. Generating...`);
+      // Attempt to generate it on the fly
+      summary = await updateSleepSummaries(userId); // This function now returns the summary or null
 
       if (!summary) {
-        return res.status(404).json({ error: 'Sleep summary not found and could not be generated' });
+        logger.warn(`Sleep summary not found and could not be generated for user ${userId} (likely no data).`);
+        // Return 404 if generation failed (e.g., no underlying sleep data)
+        return res.status(404).json({ message: 'Sleep summary not found. No sleep data available to generate one.', summary: null });
       }
+       logger.info(`Sleep summary generated successfully on demand for user ${userId}.`);
+    } else {
+       logger.debug(`Retrieved existing sleep summary for user ${userId}.`);
     }
 
     return res.status(200).json({ summary });
+
   } catch (error) {
-    console.error('Error getting sleep summary:', error);
-    return res.status(500).json({ error: 'Failed to retrieve sleep summary' });
+    logger.error(`Error getting sleep summary for user ${userId}:`, { error: error.message, stack: error.stack });
+    return res.status(500).json({ error: 'Failed to retrieve sleep summary.' });
   }
 };
 
-// Helper: Update sleep summaries
+
+// --- Helper Functions (Internal) ---
+
+/**
+ * Calculates and updates sleep summary statistics in Firestore.
+ * @param {string} userId - The user ID.
+ * @returns {Promise<SleepSummary|null>} The generated SleepSummary object or null if no data.
+ * @private
+ */
 const updateSleepSummaries = async (userId) => {
   const firestore = admin.firestore();
+  const dailyCollectionRef = firestore.collection('sleepData').doc(userId).collection('daily');
+
+  logger.info(`Starting sleep summary update for user ${userId}`);
 
   try {
-    // Ensure the sleepData collection and user document exist with default values
-    const sleepDataRef = await firestoreUtils.ensureSubcollection(
-      'sleepData', 
-      userId, 
-      'daily',
-      { userId, created: admin.firestore.FieldValue.serverTimestamp() }
-    );
-
-    // Get current month data
-    const currentMonth = moment().startOf('month');
-    const currentMonthData = await sleepDataRef
-      .where('date', '>=', currentMonth.toDate())
-      .where('date', '<=', moment().toDate())
+    // Get all data for overall statistics (consider limiting if dataset is huge)
+    // Adding a limit for sanity, e.g., last 2 years. Adjust as needed.
+    const twoYearsAgo = moment.utc().subtract(2, 'years').startOf('day').toDate();
+    const allDataSnapshot = await dailyCollectionRef
+       .where('date', '>=', twoYearsAgo) // Limit query range
       .orderBy('date', 'asc')
       .get();
 
-    // Get previous month data
-    const previousMonth = moment().subtract(1, 'month').startOf('month');
-    const previousMonthEnd = moment().subtract(1, 'month').endOf('month');
-    const previousMonthData = await sleepDataRef
-      .where('date', '>=', previousMonth.toDate())
-      .where('date', '<=', previousMonthEnd.toDate())
-      .orderBy('date', 'asc')
-      .get();
-
-    // Get all data for overall statistics
-    const allData = await sleepDataRef
-      .orderBy('date', 'asc')
-      .get();
-
-    if (allData.empty) {
-      // No sleep data exists yet
+    if (allDataSnapshot.empty) {
+      logger.info(`No sleep data found for user ${userId} within the summary period. Cannot generate summary.`);
+      // Clean up potentially existing old summary? Optional.
+      // await firestore.collection('sleepSummaries').doc(userId).delete();
       return null;
     }
 
-    // Calculate averages
-    const currentMonthAvg = calculateAverage(currentMonthData, 'ouraScore');
-    const previousMonthAvg = calculateAverage(previousMonthData, 'ouraScore');
-    const overallAvg = calculateAverage(allData, 'ouraScore');
-
-    // Calculate best and worst scores
-    const allDocs = allData.docs.map(doc => {
+    const allDocsData = allDataSnapshot.docs.map(doc => {
       const data = doc.data();
+      // Ensure date is a Date object and score is a number
+      const date = data.date?.toDate ? data.date.toDate() : (data.date instanceof Date ? data.date : null);
+      const score = typeof data.ouraScore === 'number' ? data.ouraScore : null;
+      if (!date || score === null) {
+          logger.warn(`Skipping record in summary calculation due to invalid date/score for user ${userId}, doc ID ${doc.id}`);
+          return null; // Skip invalid records
+      }
       return {
-        date: data.date.toDate(),
-        score: data.ouraScore || 0
+        id: doc.id, // dateId (YYYY-MM-DD)
+        date: date,
+        score: score
       };
+    }).filter(Boolean); // Filter out nulls
+
+
+     if (allDocsData.length === 0) {
+        logger.info(`No valid sleep records found after filtering for user ${userId}. Cannot generate summary.`);
+        return null;
+    }
+
+    // Calculate averages using valid data
+    const currentMonthStart = moment.utc().startOf('month');
+    const previousMonthStart = moment.utc().subtract(1, 'month').startOf('month');
+    const previousMonthEnd = moment.utc().subtract(1, 'month').endOf('month');
+
+    const currentMonthData = allDocsData.filter(d => moment.utc(d.date).isSameOrAfter(currentMonthStart));
+    const previousMonthData = allDocsData.filter(d => {
+        const mDate = moment.utc(d.date);
+        return mDate.isSameOrAfter(previousMonthStart) && mDate.isSameOrBefore(previousMonthEnd);
     });
 
-    // Sort by score to find best and worst
-    const sortedByScore = [...allDocs].sort((a, b) => b.score - a.score);
-    const bestScore = sortedByScore.length > 0 ? sortedByScore[0] : null;
-    const worstScore = sortedByScore.length > 0 ? sortedByScore[sortedByScore.length - 1] : null;
+    const currentMonthAvg = calculateAverageScore(currentMonthData);
+    const previousMonthAvg = calculateAverageScore(previousMonthData);
+    const overallAvg = calculateAverageScore(allDocsData);
 
-    // Calculate streaks
-    const goodScoreStreak = calculateStreak(allDocs, 70); // 70+ is considered good
-    const perfectScoreStreak = calculateStreak(allDocs, 85); // 85+ is considered excellent
+    // Calculate best and worst scores
+    const sortedByScore = [...allDocsData].sort((a, b) => b.score - a.score);
+    const bestScoreData = sortedByScore[0]; // Highest score
+    const worstScoreData = sortedByScore[sortedByScore.length - 1]; // Lowest score
 
-    // Calculate monthly trend
-    const monthlyTrend = calculateMonthlyTrend(allDocs);
+    // Calculate streaks (using date-sorted data)
+    const goodScoreThreshold = 75; // Example threshold
+    const perfectScoreThreshold = 85; // Example threshold
+    const goodScoreStreak = calculateStreak(allDocsData, goodScoreThreshold);
+    const perfectScoreStreak = calculateStreak(allDocsData, perfectScoreThreshold);
 
-    // Create summary object
+    // Calculate monthly trend (last 6 months with data)
+    const monthlyTrend = calculateMonthlyTrend(allDocsData);
+
+    // Create summary object using the SleepSummary model
     const summary = new SleepSummary({
       userId,
-      updated: new Date(),
+      updatedAt: new Date(), // Use JS Date, Firestore converts
       currentMonth: {
-        average: currentMonthAvg,
-        startDate: currentMonth.toDate(),
-        endDate: new Date()
+        averageScore: currentMonthAvg,
+        startDate: currentMonthStart.toDate(),
+        endDate: moment.utc().endOf('day').toDate(), // Today
+        recordCount: currentMonthData.length
       },
       previousMonth: {
-        average: previousMonthAvg,
-        startDate: previousMonth.toDate(),
-        endDate: previousMonthEnd.toDate()
+        averageScore: previousMonthAvg,
+        startDate: previousMonthStart.toDate(),
+        endDate: previousMonthEnd.toDate(),
+         recordCount: previousMonthData.length
       },
       overall: {
-        average: overallAvg,
-        bestScore: bestScore ? bestScore.score : 0,
-        bestScoreDate: bestScore ? bestScore.date : null,
-        worstScore: worstScore ? worstScore.score : 0,
-        worstScoreDate: worstScore ? worstScore.date : null
+        averageScore: overallAvg,
+        bestScore: bestScoreData ? bestScoreData.score : null,
+        bestScoreDate: bestScoreData ? bestScoreData.date : null,
+        worstScore: worstScoreData ? worstScoreData.score : null,
+        worstScoreDate: worstScoreData ? worstScoreData.date : null,
+        recordCount: allDocsData.length,
+        firstDate: allDocsData[0]?.date, // Assumes allDocsData is date-sorted ASC
+        lastDate: allDocsData[allDocsData.length - 1]?.date
       },
       streaks: {
+        goodScoreThreshold: goodScoreThreshold,
         goodScore: goodScoreStreak,
+        perfectScoreThreshold: perfectScoreThreshold,
         perfectScore: perfectScoreStreak
       },
-      monthlyTrend
+      monthlyTrend: monthlyTrend // Array of { month: 'YYYY-MM', averageScore: X, recordCount: Y }
     });
 
     // Save summary to Firestore
     await firestore
       .collection('sleepSummaries')
       .doc(userId)
-      .set(summary.toFirestore(), { merge: true });
+      .set(summary.toFirestore ? summary.toFirestore() : { ...summary }, { merge: true }); // Use toFirestore if available
 
-    return summary;
+     logger.info(`Successfully updated sleep summary for user ${userId}.`);
+    return summary; // Return the generated summary
+
   } catch (error) {
-    console.error(`Error updating sleep summaries for user ${userId}:`, error);
+    logger.error(`Error updating sleep summaries for user ${userId}:`, { error: error.message, stack: error.stack });
+    // Don't re-throw, just log and return null to indicate failure
     return null;
   }
 };
 
-// Helper: Calculate average score
-const calculateAverage = (snapshot, field) => {
-  if (snapshot.empty) {
+/**
+ * Helper: Calculate average score from an array of data points.
+ * @param {Array<{score: number}>} dataPoints - Array of objects with a 'score' property.
+ * @returns {number} Calculated average score (rounded to 1 decimal) or 0 if no data.
+ * @private
+ */
+const calculateAverageScore = (dataPoints) => {
+  if (!dataPoints || dataPoints.length === 0) {
     return 0;
   }
-
-  let sum = 0;
-  let count = 0;
-
-  snapshot.forEach(doc => {
-    const value = doc.data()[field];
-    if (value !== undefined) {
-      sum += value;
-      count++;
-    }
-  });
-
-  return count > 0 ? Math.round((sum / count) * 10) / 10 : 0;
+  const validScores = dataPoints.map(d => d.score).filter(s => typeof s === 'number');
+  if (validScores.length === 0) {
+      return 0;
+  }
+  const sum = validScores.reduce((acc, score) => acc + score, 0);
+  const average = sum / validScores.length;
+  return Math.round(average * 10) / 10; // Round to one decimal place
 };
 
-// Helper: Calculate longest streak of scores above threshold
-const calculateStreak = (docs, threshold) => {
-  if (!docs.length) {
-    return {
-      current: 0,
-      longest: 0,
-      longestStart: null,
-      longestEnd: null
-    };
-  }
-
-  // Sort by date ascending
-  const sortedDocs = [...docs].sort((a, b) => a.date - b.date);
-
+/**
+ * Helper: Calculate longest and current streak of scores >= threshold.
+ * Assumes input `docs` are sorted by date ascending.
+ * @param {Array<{date: Date, score: number}>} sortedDocs - Array of score objects sorted by date ASC.
+ * @param {number} threshold - The score threshold for the streak.
+ * @returns {object} Object containing current streak, longest streak details.
+ * @private
+ */
+const calculateStreak = (sortedDocs, threshold) => {
   let currentStreak = 0;
   let longestStreak = 0;
-  let longestStart = null;
-  let longestEnd = null;
-  let currentStart = null;
+  let longestStreakStartDate = null;
+  let longestStreakEndDate = null;
+  let currentStreakStartDate = null; // Track start date of current streak
+
+  if (!sortedDocs || sortedDocs.length === 0) {
+      return { current: 0, longest: 0, longestStartDate: null, longestEndDate: null };
+  }
+
+  // Ensure data is sorted by date (important!)
+  // The caller should ideally provide sorted data, but we can sort here as a fallback
+  // sortedDocs.sort((a, b) => a.date.getTime() - b.date.getTime()); // Uncomment if input might not be sorted
 
   sortedDocs.forEach((doc, index) => {
     if (doc.score >= threshold) {
       if (currentStreak === 0) {
-        currentStart = doc.date;
+        currentStreakStartDate = doc.date; // Start of a new streak
       }
       currentStreak++;
     } else {
-      // Streak broken
+      // Streak broken or never started
       if (currentStreak > longestStreak) {
+        // The ended streak was the longest so far
         longestStreak = currentStreak;
-        longestStart = currentStart;
-        longestEnd = sortedDocs[index - 1].date;
+        longestStreakStartDate = currentStreakStartDate;
+        // End date is the date of the *last* successful day in the streak
+        longestStreakEndDate = index > 0 ? sortedDocs[index - 1].date : currentStreakStartDate; // Handle edge case of first item breaking streak
       }
+      // Reset current streak
       currentStreak = 0;
+      currentStreakStartDate = null;
     }
   });
 
-  // Check if last streak is the longest
+  // After the loop, check if the current running streak is the longest
   if (currentStreak > longestStreak) {
     longestStreak = currentStreak;
-    longestStart = currentStart;
-    longestEnd = sortedDocs[sortedDocs.length - 1].date;
+    longestStreakStartDate = currentStreakStartDate;
+    longestStreakEndDate = sortedDocs[sortedDocs.length - 1].date; // Ends on the last day
   }
 
+  // Determine if the *current* streak is ongoing (i.e., the last day met the threshold)
+  const lastDayMetThreshold = sortedDocs[sortedDocs.length - 1]?.score >= threshold;
+  const finalCurrentStreak = lastDayMetThreshold ? currentStreak : 0;
+
+
   return {
-    current: currentStreak,
+    current: finalCurrentStreak,
     longest: longestStreak,
-    longestStart,
-    longestEnd
+    longestStartDate: longestStreakStartDate,
+    longestEndDate: longestStreakEndDate
   };
 };
 
-// Helper: Calculate monthly trend
-const calculateMonthlyTrend = (docs) => {
-  const months = {};
+/**
+ * Helper: Calculate average score per month for the last N months with data.
+ * Assumes input `docs` are sorted by date ascending.
+ * @param {Array<{date: Date, score: number}>} sortedDocs - Array of score objects sorted by date ASC.
+ * @param {number} [numMonths=6] - Number of recent months to include in the trend.
+ * @returns {Array<object>} Array of { month: 'YYYY-MM', averageScore: X, recordCount: Y } for recent months.
+ * @private
+ */
+const calculateMonthlyTrend = (sortedDocs, numMonths = 6) => {
+  if (!sortedDocs || sortedDocs.length === 0) {
+    return [];
+  }
 
-  docs.forEach(doc => {
-    const monthStart = moment(doc.date).startOf('month').format('YYYY-MM');
-    if (!months[monthStart]) {
-      months[monthStart] = {
-        month: monthStart,
-        scores: []
+  const monthlyData = {}; // Use object keyed by 'YYYY-MM'
+
+  sortedDocs.forEach(doc => {
+    const monthKey = moment.utc(doc.date).format('YYYY-MM');
+    if (!monthlyData[monthKey]) {
+      monthlyData[monthKey] = {
+        month: monthKey,
+        scores: [],
+        recordCount: 0
       };
     }
-    months[monthStart].scores.push(doc.score);
+    monthlyData[monthKey].scores.push(doc.score);
+    monthlyData[monthKey].recordCount++;
   });
 
-  // Calculate average for each month
-  // Only last 6 months
-  return Object.values(months)
-      .map(month => ({
-        month: month.month,
-        average: Math.round((month.scores.reduce((sum, score) => sum + score, 0) / month.scores.length) * 10) / 10
-      }))
-      .slice(-6);
+  // Calculate average for each month and sort by month
+  const trend = Object.values(monthlyData)
+    .map(monthStats => ({
+      month: monthStats.month,
+      averageScore: calculateAverageScore(monthStats.scores.map(s => ({score: s}))), // Reuse helper
+      recordCount: monthStats.recordCount
+    }))
+    .sort((a, b) => a.month.localeCompare(b.month)); // Sort chronologically
+
+  // Return only the last N months
+  return trend.slice(-numMonths);
 };
 
-// Init function to initialize controller with dependencies
-const init = (fsUtils) => {
-  firestoreUtils = fsUtils;
-  console.log('Sleep controller initialized with Firestore utils');
-};
-
+// --- Module Exports ---
 module.exports = {
   init,
   getSleepData,
   getSleepDataRange,
   syncOuraData,
   addSleepNote,
-  getSleepSummary
+  getSleepSummary,
+  // Expose summary update if needed for admin tasks, but generally internal
+  // updateSleepSummaries
 };
