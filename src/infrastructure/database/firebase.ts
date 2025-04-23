@@ -17,8 +17,8 @@ export function initializeFirebase(): admin.firestore.Firestore {
     // set credentials path
     let serviceAccount;
 
-    if (config.app.env == "production" && config.firebase.serviceAccount) {
-      serviceAccount = config.firebase.serviceAccount;
+    if (config.nodeEnv == "production" && config.firebaseServiceAccount) {
+      serviceAccount = config.firebaseServiceAccount;
       logger.info("Firebase service acocunt from ENV")
     } else {
 
@@ -37,17 +37,54 @@ export function initializeFirebase(): admin.firestore.Firestore {
       credentials: admin.credential.cert(serviceAccount),
     });
 
+    // initialize with optimized settings
     firestoreInstance = admin.firestore();
 
+    if (config.nodeEnv == "production") {
 
+      // prod optimizations
+      firestoreInstance.settings({
+        ignoreUndefinedProperties: true;
+        cacheSizeBytes: 1073741824 // 1GB
+      });
+    }
 
+    firebaseInitialized = true;
+    logger.info("Firebase admin initialized");
 
+    return firestoreInstance;
+  } catch (error) {
+    logger.error("Failed to start firebase", { error: (error as Error).message });
+    throw error;
   }
-
-
 }
 
+// return firestoreInstance
+export function getFirestore(): admin.firestore.Firestore {
+  if (!firebaseInitialized) {
+    return initializeFirebase();
+  }
+  return firestoreInstance;
+}
 
+// return firestore auth instance
+export function getAuth(): admin.auth.Auth {
+  if (!firebaseInitialized) {
+    initializeFirebase();
+  }
+  return admin.auth();
+}
 
-
+// close firebase connection (dev/tests)
+export async function closeFirebase(): Promise<void> {
+  if (firebaseInitialized) {
+    try {
+      await admin.app().delete();
+      firebaseInitialized = false;
+      logger.info("firebase conneciton closed");
+    } catch (error) {
+      logger.error("Error closing firebase", { error: (error as Error).message});
+    }
+  }
+} 
 
